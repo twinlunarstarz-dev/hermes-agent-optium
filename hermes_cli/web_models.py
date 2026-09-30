@@ -469,6 +469,21 @@ class ProfileModelUpdate(BaseModel):
     provider: str
     model: str
 
+class ProfileVoiceUpdate(BaseModel):
+    """Per-profile Qwen3-TTS voice-clone settings (tts.qwen3_tts.voice_cloning.*).
+
+    Every field is optional so the editor can send a partial change; omitted keys
+    keep their current value. ``enabled`` toggles cloning, and when it is off the
+    reference clip is irrelevant, so the client omits the rest.
+    """
+    enabled: Optional[bool] = None
+    ref_audio: Optional[str] = None
+    ref_text: Optional[str] = None
+    model_dir: Optional[str] = None
+    mode: Optional[str] = None
+    seed: Optional[int] = None
+    base_voice: Optional[str] = None
+
 class ProfileDescribeAuto(BaseModel):
     overwrite: bool = False
 

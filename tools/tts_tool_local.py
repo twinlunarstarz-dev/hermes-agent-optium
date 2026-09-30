@@ -22,6 +22,7 @@ DEFAULT_KITTENTTS_MODEL = "KittenML/kitten-tts-nano-0.8-int8"  # 25MB
 DEFAULT_KITTENTTS_VOICE = "Jasper"
 DEFAULT_PIPER_VOICE = "en_US-lessac-medium"  # balanced size/quality
 _NEUTTS_SAMPLES = Path(__file__).parent / "neutts_samples"
+_NEUTTS_TIMEOUT_SECONDS = 300
 
 # --- Bounded model caches ---
 # Each entry is a whole loaded model (tens of MB); unbounded, one would be pinned per distinct
@@ -68,7 +69,19 @@ def _generate_neutts(text: str, output_path: str, tts_config: Dict[str, Any]) ->
         "--ref-text", neutts_config.get("ref_text", "") or str(_NEUTTS_SAMPLES / "jo.txt"),
         "--model", neutts_config.get("model", "neuphonic/neutts-air-q4-gguf"),
         "--device", neutts_config.get("device", "cpu")]
-    result = _run_helper(cmd, 120)
+    language = neutts_config.get("language")
+    if language:
+        cmd.extend(["--language", str(language)])
+    try:
+        timeout = int(neutts_config.get("timeout", _NEUTTS_TIMEOUT_SECONDS))
+    except (TypeError, ValueError):
+        timeout = _NEUTTS_TIMEOUT_SECONDS
+    if timeout <= 0:
+        timeout = _NEUTTS_TIMEOUT_SECONDS
+    try:
+        result = _run_helper(cmd, timeout)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"NeuTTS synthesis timed out after {timeout}s") from exc
     if result.returncode != 0:  # the synth script reports success lines as "OK:" on stderr too
         error_lines = [l for l in result.stderr.strip().splitlines() if not l.startswith("OK:")]
         raise RuntimeError(f"NeuTTS synthesis failed: {chr(10).join(error_lines) or 'unknown error'}")

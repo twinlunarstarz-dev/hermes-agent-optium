@@ -42,6 +42,29 @@ class TestThinkBlockStrip:
         assert "one" in spoken and "two" in spoken
 
 
+    def test_displayed_reasoning_block_removed_before_voice(self):
+        raw = (
+            "💭 **Reasoning:**\n"
+            "```\n"
+            "private reasoning that must not be spoken\n"
+            "```\n\n"
+            "The visible answer is ready."
+        )
+        spoken = prepare_spoken_text(raw, max_chars=None)
+        assert spoken == "The visible answer is ready."
+        assert "Reasoning" not in spoken
+
+    def test_leading_reasoning_label_removed_only(self):
+        spoken = prepare_spoken_text("Reasoning: The visible answer is ready.", max_chars=None)
+        assert spoken == "The visible answer is ready."
+
+    def test_reasoning_word_inside_visible_answer_is_preserved(self):
+        raw = "The answer explains the reasoning behind the change.\n\nReasoning is part of the explanation."
+        spoken = prepare_spoken_text(raw, max_chars=None)
+        assert "reasoning behind the change" in spoken
+        assert "Reasoning is part of the explanation" in spoken
+
+
 class TestVerifierFooterStrip:
     FOOTER = (
         "⚠️ File-mutation verifier: 2 file(s) were NOT modified this turn "

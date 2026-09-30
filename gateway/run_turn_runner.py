@@ -989,7 +989,14 @@ class TurnRunner:
             if stream_consumer is not None:
                 stream_consumer.on_segment_break() if already_streamed else stream_consumer.on_commentary(text)
             elif not already_streamed and ctx._status_adapter and str(text or "").strip():
-                self._send_status_text(text, ctx._status_thread_metadata, "interim_assistant_callback scheduling error")
+                # This is the real user-facing assistant commentary lane when no stream consumer
+                # exists. Mark it interim so adapters can distinguish it from a turn-final send
+                # (and Discord's voice hook can speak it without doubling the final).
+                from gateway.run import _interim_metadata
+                self._send_status_text(
+                    text, _interim_metadata(ctx._status_thread_metadata),
+                    "interim_assistant_callback scheduling error",
+                )
 
         return stream_consumer, stream_delta_cb, interim_assistant_cb, want_interim_messages
 

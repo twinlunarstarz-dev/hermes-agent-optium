@@ -77,6 +77,17 @@ class TestRouteDecision:
                 "anthropic", "claude-opus-4-5", cfg
             ) is True
 
+    def test_same_aux_provider_model_keeps_capture_native(self):
+        """The configured aux route equal to the active route should not double-analyze."""
+        from tools.computer_use import vision_routing
+
+        cfg = {"auxiliary": {"vision": {"provider": "openrouter", "model": "anthropic/claude-opus-4-6"}}}
+        with patch.object(vision_routing, "_lookup_user_declared_supports_vision", return_value=True), \
+             patch.object(vision_routing, "_provider_accepts_multimodal_tool_result", return_value=True):
+            assert vision_routing.should_route_capture_to_aux_vision(
+                "openrouter", "anthropic/claude-opus-4-6", cfg
+            ) is False
+
     def test_non_vision_main_model_routes_to_aux(self):
         """The reported #24015 scenario: tencent/hy3-preview has no vision."""
         from tools.computer_use import vision_routing

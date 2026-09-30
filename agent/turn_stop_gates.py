@@ -33,6 +33,14 @@ class StopGateVerdict:
 
 
 def _verify_on_stop_nudge(agent) -> Optional[str]:
+    # Cron owns an autonomous one-turn execution contract: its text answer is the
+    # deliverable.  A verify-on-stop continuation after a runtime state-file edit
+    # can replace a completed broker/reporting response with synthetic verification
+    # commentary, while the scheduled prompt may not even permit terminal access.
+    # Cron agents must perform any required verification in their ordinary tool
+    # loop before answering; never reopen the turn after their final response.
+    if str(getattr(agent, "platform", "") or "").lower() == "cron":
+        return None
     try:
         from agent.verification_stop import (
             build_verify_on_stop_nudge, verify_on_stop_enabled

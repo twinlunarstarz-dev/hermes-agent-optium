@@ -13,6 +13,7 @@ import {
   Check,
   ChevronDown,
   Cpu,
+  Mic,
   MoreVertical,
   Pencil,
   Package,
@@ -99,6 +100,7 @@ function ProfileActionsMenu({
   onEditDescription,
   onEditModel,
   onEditSoul,
+  onEditVoice,
   onManageSkills,
   onRename,
   onSetActive,
@@ -203,6 +205,16 @@ function ProfileActionsMenu({
               </span>
             )}
             {labels.editSoul}
+          </button>
+
+          <button
+            type="button"
+            role="menuitem"
+            className={itemClass}
+            onClick={run(onEditVoice)}
+          >
+            <Mic className="h-4 w-4" />
+            {labels.editVoice}
           </button>
 
           <button
@@ -345,6 +357,14 @@ export default function ProfilesPage() {
   // Tracks the latest SOUL request so out-of-order responses don't overwrite
   // newer state when the user switches profiles or closes the editor.
   const activeSoulRequest = useRef<string | null>(null);
+
+  // Inline voice-clone editor state (per-profile Qwen3-TTS reference clip)
+  const [editingVoiceFor, setEditingVoiceFor] = useState<string | null>(null);
+  const [voiceRefAudio, setVoiceRefAudio] = useState("");
+  const [voiceRefText, setVoiceRefText] = useState("");
+  const [voiceCloneEnabled, setVoiceCloneEnabled] = useState(true);
+  const [voiceSaving, setVoiceSaving] = useState(false);
+  const activeVoiceRequest = useRef<string | null>(null);
 
   // Inline description editor state
   const [editingDescFor, setEditingDescFor] = useState<string | null>(null);
@@ -550,6 +570,53 @@ export default function ProfilesPage() {
     [closeEditor, editingSoulFor, showToast, t.status.error],
   );
 
+  const openVoiceEditor = useCallback(
+    (p: ProfileInfo) => {
+      if (editingVoiceFor === p.name) {
+        closeEditor();
+        return;
+      }
+      activeVoiceRequest.current = p.name;
+      setEditingSoulFor(null);
+      setEditingModelFor(null);
+      setEditingDescFor(null);
+      setEditingVoiceFor(p.name);
+      setVoiceRefAudio("");
+      setVoiceRefText("");
+      setVoiceCloneEnabled(true);
+      // Fetch the profile's current clone settings so the editor opens on the
+      // real values instead of blanks that would overwrite them on save.
+      api
+        .getProfileVoice(p.name)
+        .then((res) => {
+          if (activeVoiceRequest.current !== p.name) return;
+          setVoiceRefAudio(res.clone.ref_audio ?? "");
+          setVoiceRefText(res.clone.ref_text ?? "");
+          setVoiceCloneEnabled(res.clone.enabled ?? true);
+        })
+        .catch((e) => showToast(`${t.status.error}: ${e}`, "error"));
+    },
+    [closeEditor, editingVoiceFor, showToast, t.status.error],
+  );
+
+  const handleSaveVoice = async (name: string) => {
+    setVoiceSaving(true);
+    try {
+      await api.updateProfileVoice(name, {
+        enabled: voiceCloneEnabled,
+        ...(voiceRefAudio.trim() ? { ref_audio: voiceRefAudio.trim() } : {}),
+        ...(voiceRefText.trim() ? { ref_text: voiceRefText.trim() } : {}),
+      });
+      showToast(`${t.profiles.voiceSaved}: ${name}`, "success");
+      activeVoiceRequest.current = null;
+      setEditingVoiceFor(null);
+    } catch (e) {
+      showToast(`${t.status.error}: ${e}`, "error");
+    } finally {
+      setVoiceSaving(false);
+    }
+  };
+
   const handleSaveSoul = async (name: string) => {
     setSoulSaving(true);
     try {
@@ -689,14 +756,17 @@ export default function ProfilesPage() {
 
   // Exactly one editor is open at a time; derive which profile + kind so a
   // single dialog can render the right body.
-  const editorName = editingModelFor ?? editingDescFor ?? editingSoulFor;
-  const editorKind: "model" | "desc" | "soul" | null = editingModelFor
+  const editorName =
+    editingModelFor ?? editingDescFor ?? editingSoulFor ?? editingVoiceFor;
+  const editorKind: "model" | "desc" | "soul" | "voice" | null = editingModelFor
     ? "model"
     : editingDescFor
       ? "desc"
       : editingSoulFor
         ? "soul"
-        : null;
+        : editingVoiceFor
+          ? "voice"
+          : null;
   const editorModalRef = useModalBehavior({
     open: editorName != null,
     onClose: closeEditor,
@@ -1138,6 +1208,7 @@ export default function ProfilesPage() {
                             editModel: L.editModel,
                             editDescription: L.editDescription,
                             editSoul: t.profiles.editSoul,
+                            editVoice: t.profiles.editVoice,
                             manageSkills: L.manageSkills,
                             openInTerminal: t.profiles.openInTerminal,
                             rename: t.profiles.rename,
@@ -1150,6 +1221,7 @@ export default function ProfilesPage() {
                           onEditDescription={() => openDescEditor(p)}
                           onEditModel={() => openModelEditor(p)}
                           onEditSoul={() => openSoulEditor(p.name)}
+                          onEditVoice={() => openVoiceEditor(p)}
                           onManageSkills={() =>
                             navigate(
                               `/skills?profile=${encodeURIComponent(p.name)}`,
@@ -1263,7 +1335,9 @@ export default function ProfilesPage() {
                   ? L.editModel
                   : editorKind === "desc"
                     ? L.description
-                    : t.profiles.soulSection}
+                    : editorKind === "voice"
+                      ? t.profiles.voiceSection
+                      : t.profiles.soulSection}
                 <span className="text-muted-foreground"> · {editorName}</span>
               </h2>
             </header>
@@ -1360,6 +1434,68 @@ export default function ProfilesPage() {
                 </>
               )}
 
+              {editorKind === "voice" && (
+                <>
+                  <label className="flex items-center gap-2 text-sm">
+                    <input
+                      type="checkbox"
+                      checked={voiceCloneEnabled}
+                      onChange={(e) => setVoiceCloneEnabled(e.target.checked)}
+                    />
+                    {t.profiles.voiceCloneEnabled}
+                  </label>
+
+                  <p className="text-xs text-muted-foreground">
+                    {t.profiles.voiceCloneHint}
+                  </p>
+
+                  <div className="grid gap-1.5">
+                    <Label
+                      htmlFor="profile-voice-ref-audio"
+                      className="font-mondwest text-display text-xs tracking-wider text-muted-foreground"
+                    >
+                      {t.profiles.voiceRefAudio}
+                    </Label>
+                    <input
+                      id="profile-voice-ref-audio"
+                      className="w-full border border-input bg-transparent px-3 py-2 text-sm shadow-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                      placeholder="/models/voice-samples/default.wav"
+                      value={voiceRefAudio}
+                      disabled={!voiceCloneEnabled}
+                      onChange={(e) => setVoiceRefAudio(e.target.value)}
+                    />
+                  </div>
+
+                  <div className="grid gap-1.5">
+                    <Label
+                      htmlFor="profile-voice-ref-text"
+                      className="font-mondwest text-display text-xs tracking-wider text-muted-foreground"
+                    >
+                      {t.profiles.voiceRefText}
+                    </Label>
+                    <input
+                      id="profile-voice-ref-text"
+                      className="w-full border border-input bg-transparent px-3 py-2 text-sm shadow-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                      placeholder="/models/voice-samples/default.txt"
+                      value={voiceRefText}
+                      disabled={!voiceCloneEnabled}
+                      onChange={(e) => setVoiceRefText(e.target.value)}
+                    />
+                  </div>
+
+                  <div className="flex justify-end">
+                    <Button
+                      size="sm"
+                      className="uppercase"
+                      onClick={() => handleSaveVoice(editorName)}
+                      disabled={voiceSaving}
+                    >
+                      {voiceSaving ? t.common.saving : t.common.save}
+                    </Button>
+                  </div>
+                </>
+              )}
+
               {editorKind === "soul" && (
                 <>
                   <Label
@@ -1409,6 +1545,7 @@ interface ProfileActionsMenuProps {
     editDescription: string;
     editModel: string;
     editSoul: string;
+    editVoice: string;
     manageSkills: string;
     openInTerminal: string;
     rename: string;
@@ -1420,6 +1557,7 @@ interface ProfileActionsMenuProps {
   onEditDescription: () => void;
   onEditModel: () => void;
   onEditSoul: () => void;
+  onEditVoice: () => void;
   onManageSkills: () => void;
   onRename: () => void;
   onSetActive: () => void;

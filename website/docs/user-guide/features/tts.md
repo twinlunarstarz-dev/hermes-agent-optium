@@ -96,7 +96,9 @@ tts:
     ref_audio: ''
     ref_text: ''
     model: neuphonic/neutts-air-q4-gguf
+    language: en-us                         # eSpeak language code for custom GGUF backbones
     device: cpu
+    timeout: 300                            # cold model load plus synthesis may take a while
   kittentts:
     model: KittenML/kitten-tts-nano-0.8-int8   # 25MB int8; also: kitten-tts-micro-0.8 (41MB), kitten-tts-mini-0.8 (80MB)
     voice: Jasper                               # Jasper, Bella, Luna, Bruno, Rosie, Hugo, Kiki, Leo

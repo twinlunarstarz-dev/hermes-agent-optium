@@ -7,23 +7,25 @@ it as a normal push instead of a silent message — mirroring the existing
 final-text path in ``gateway/platforms/base.py``.
 """
 
+import asyncio
 import json
 import os
 import tempfile
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+import gateway.run_voice as gateway_run_voice
 from gateway.config import Platform
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource
 
 
-def _make_event(thread_id=None):
+def _make_event(thread_id=None, platform=Platform.TELEGRAM):
     source = SessionSource(
-        platform=Platform.TELEGRAM,
+        platform=platform,
         chat_id="208214988",
         user_id="208214988",
         chat_type="dm",
@@ -83,6 +85,10 @@ async def test_voice_reply_marks_existing_thread_metadata_without_mutation(monke
     snapshot_copy = dict(source_meta_snapshot)
 
     await runner._send_voice_reply(event, "Hello there.")
+    # Drain the spawned background task before asserting on the mock.
+    pending = [t for t in getattr(gateway_run_voice, "_PENDING_VOICE_DELIVERIES", set())]
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
 
     send_voice.assert_awaited_once()
     kwargs = send_voice.await_args.kwargs
@@ -96,3 +102,96 @@ async def test_voice_reply_marks_existing_thread_metadata_without_mutation(monke
         event.source, runner._reply_anchor_for_event(event)
     )
     assert "notify" not in fresh
+
+
+@pytest.mark.asyncio
+async def test_failed_final_tts_cancels_reserved_message(monkeypatch):
+    cancel = MagicMock()
+    adapter = SimpleNamespace(
+        reserve_voice_speech=MagicMock(return_value=7),
+        cancel_voice_speech_reservation=cancel,
+        is_in_voice_channel=lambda guild_id: guild_id == 42,
+    )
+    runner = _runner_with_adapter(AsyncMock())
+    runner.adapters = {Platform.DISCORD: adapter}
+    event = _make_event(platform=Platform.DISCORD)
+    event.raw_message = SimpleNamespace(guild_id=42, guild=None)
+    monkeypatch.setattr(
+        "tools.tts_tool.text_to_speech_tool",
+        lambda **_kwargs: json.dumps({"success": False, "error": "provider unavailable"}),
+    )
+
+    await runner._prepare_voice_reply_delivery(event, "This message will fail synthesis.", ticket=7)
+
+    cancel.assert_called_once_with(42, 7)
+
+
+@pytest.mark.asyncio
+async def test_connected_discord_final_voice_does_not_cancel_published_reservation(monkeypatch, tmp_path):
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
+    _fake_tts_call(monkeypatch)
+    cancel = MagicMock()
+    adapter = SimpleNamespace(
+        enqueue_voice_speech_batch=MagicMock(return_value=True),
+        cancel_voice_speech_reservation=cancel,
+        is_in_voice_channel=lambda guild_id: guild_id == 42,
+    )
+    runner = _runner_with_adapter(AsyncMock())
+    runner.adapters = {Platform.DISCORD: adapter}
+    event = _make_event(platform=Platform.DISCORD)
+    event.raw_message = SimpleNamespace(guild_id=42, guild=None)
+
+    await runner._prepare_voice_reply_delivery(event, "This final reply is accepted.", ticket=7)
+
+    cancel.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_connected_discord_final_voice_keeps_queue_owned_file_until_playback(
+    monkeypatch, tmp_path,
+):
+    """An accepted FIFO handoff must not be unlinked by the synthesis task's finally block."""
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
+    _fake_tts_call(monkeypatch)
+    adapter = SimpleNamespace(
+        enqueue_voice_speech_batch=MagicMock(return_value=True),
+        cancel_voice_speech_reservation=MagicMock(),
+        is_in_voice_channel=lambda guild_id: guild_id == 42,
+    )
+    runner = _runner_with_adapter(AsyncMock())
+    runner.adapters = {Platform.DISCORD: adapter}
+    event = _make_event(platform=Platform.DISCORD)
+    event.raw_message = SimpleNamespace(guild_id=42, guild=None)
+
+    await runner._prepare_voice_reply_delivery(
+        event, "This queued file must still exist.", ticket=7,
+    )
+
+    queued_files = list((tmp_path / "hermes_voice").glob("tts_reply_*.mp3"))
+    assert len(queued_files) == 1
+    assert queued_files[0].exists(), "queue owns cleanup after accepted handoff"
+    queued_files[0].unlink()
+
+
+@pytest.mark.asyncio
+async def test_connected_discord_final_voice_uses_adapter_speech_queue(monkeypatch, tmp_path):
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
+    _fake_tts_call(monkeypatch)
+    enqueue = MagicMock(return_value=True)
+    adapter = SimpleNamespace(
+        enqueue_voice_speech=enqueue,
+        is_in_voice_channel=lambda guild_id: guild_id == 42,
+        play_in_voice_channel=AsyncMock(side_effect=AssertionError("must use FIFO")),
+    )
+    runner = _runner_with_adapter(AsyncMock())
+    runner.adapters = {Platform.DISCORD: adapter}
+    event = _make_event(platform=Platform.DISCORD)
+    event.raw_message = SimpleNamespace(guild_id=42, guild=None)
+    final_audio = tmp_path / "final.mp3"
+    final_audio.write_bytes(b"audio")
+
+    await runner._deliver_voice_reply(event, [str(final_audio)])
+
+    enqueue.assert_called_once_with(42, str(final_audio))
+    adapter.play_in_voice_channel.assert_not_awaited()
+    assert final_audio.exists(), "accepted queue item must own cleanup through playback"

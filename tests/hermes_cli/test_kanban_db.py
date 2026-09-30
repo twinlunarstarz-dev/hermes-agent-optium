@@ -208,6 +208,40 @@ def test_schedule_task_parks_time_delay_without_dispatching(kanban_home):
 
 
 
+def test_live_worker_with_missing_heartbeat_is_reclaimed_after_claim_expiry(
+    kanban_home, monkeypatch,
+):
+    """A live PID without an initial heartbeat must not keep a stale claim alive.
+
+    Regression: a worker can be alive but have never emitted a heartbeat.  Once
+    its claim is already expired, treating ``last_heartbeat_at = NULL`` as fresh
+    allowed the dispatcher to extend the claim forever instead of reclaiming it.
+    """
+    import hermes_cli.kanban_db as _kb
+
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="missing heartbeat", assignee="a")
+        host = _kb._claimer_id().split(":", 1)[0]
+        kb.claim_task(conn, t, claimer=f"{host}:worker")
+        kbd._set_worker_pid(conn, t, 12345)
+        conn.execute(
+            "UPDATE tasks SET claim_expires = ?, last_heartbeat_at = NULL "
+            "WHERE id = ?",
+            (int(time.time()) - 1, t),
+        )
+        conn.commit()
+
+        # First call is the stale-claim liveness check.  Subsequent calls model
+        # the worker disappearing when the reclaim path attempts termination.
+        alive_calls = iter((True, False))
+        monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: next(alive_calls, False))
+        assert kb.release_stale_claims(conn, signal_fn=lambda _pid, _sig: None) == 1
+        assert conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (t,)
+        ).fetchone()["status"] == "ready"
+
+
+
 def test_stale_claim_reclaim_event_records_diagnostic_payload(
     kanban_home, monkeypatch,
 ):

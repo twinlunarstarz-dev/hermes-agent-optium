@@ -31,6 +31,11 @@ _OFF_SET, _ON_SET = "_auto_tts_disabled_chats", "_auto_tts_enabled_chats"
 _VOICE_MODES = {"off", "voice_only", "all"}
 
 
+# Fire-and-forget final voice deliveries: strong refs so asyncio cannot GC a playing task;
+# done tasks are discarded via callback. Files are unlinked by the delivery task itself.
+_PENDING_VOICE_DELIVERIES: set = set()
+
+
 class GatewayVoiceMixin:
     def _voice_key(self, platform: Platform, chat_id: str, profile: Optional[str] = None) -> str:
         """``<profile>:<platform>:<chat_id>`` under multiplexing (else two bots in one channel
@@ -340,14 +345,41 @@ class GatewayVoiceMixin:
         return bool(getattr(self.config, "stt_echo_transcripts", True))
 
     async def _send_voice_reply(self, event: MessageEvent, text: str) -> None:
-        """Generate TTS audio and send as a voice message before the text reply. The TTS tool
-        may return one combined file or several separately valid ones (combination unavailable /
-        over a platform limit); legacy single-file results keep working."""
+        """Reserve arrival order synchronously, then synthesize/play in the background."""
+        adapter = self._voice_adapter_for_source(event.source)
+        guild_id = self._get_guild_id(event)
+        is_in_vc = getattr(adapter, "is_in_voice_channel", None)
+        reserve = getattr(adapter, "reserve_voice_speech", None)
+        ticket = None
+        if (
+            event.source.platform == Platform.DISCORD
+            and guild_id
+            and callable(is_in_vc)
+            and is_in_vc(guild_id) is True
+            and callable(reserve)
+        ):
+            reserved = reserve(guild_id)
+            if not isinstance(reserved, int):
+                return
+            ticket = reserved
+        task = asyncio.create_task(self._prepare_voice_reply_delivery(event, text, ticket=ticket))
+        _PENDING_VOICE_DELIVERIES.add(task)
+        task.add_done_callback(_PENDING_VOICE_DELIVERIES.discard)
+
+    async def _prepare_voice_reply_delivery(
+        self, event: MessageEvent, text: str, *, ticket: Optional[int] = None
+    ) -> None:
+        """Synthesize concurrently, then hand files to playback or native voice-message chat."""
         audio_path, actual_paths = None, []
+        adapter = None
+        guild_id = None
+        reservation_published = False
         try:
-            from tools.tts_text_normalize import _strip_markdown_for_tts
+            adapter = self._voice_adapter_for_source(event.source)
+            guild_id = self._get_guild_id(event)
+            from tools.tts_text_normalize import prepare_spoken_text
             from tools.tts_tool import text_to_speech_tool
-            tts_text = _strip_markdown_for_tts(text)
+            tts_text = prepare_spoken_text(text, max_chars=None)
             if not tts_text:
                 return
             # Platforms whose native voice bubbles require Ogg/Opus (OPUS_VOICE_PLATFORMS) get an
@@ -367,31 +399,105 @@ class GatewayVoiceMixin:
                 logger.warning("Auto voice reply TTS failed: %s", result.get("error"))
                 return
             actual_paths = paths
-            await self._deliver_voice_reply(event, actual_paths)
+            if ticket is None:
+                await self._deliver_voice_reply(event, actual_paths)
+                actual_paths = []
+            else:
+                reservation_published = await self._deliver_voice_reply(
+                    event, actual_paths, ticket=ticket
+                )
+                if reservation_published:
+                    actual_paths = []
         except Exception as e:
             logger.warning("Auto voice reply failed: %s", e, exc_info=True)
         finally:
-            for p in ({audio_path, *actual_paths} - {None}):
+            if ticket is not None and not reservation_published:
+                cancel = getattr(adapter, "cancel_voice_speech_reservation", None)
+                if callable(cancel):
+                    cancel(guild_id, ticket)
+            # Once the adapter accepts the paths, its playback worker owns cleanup. Do not unlink
+            # the requested output here: it is commonly the same file in the queue, and deleting it
+            # before playback falls back to FFmpegPCMAudio, which pauses incoming VoiceReceiver audio.
+            cleanup_paths = set() if reservation_published else {audio_path, *actual_paths} - {None}
+            for path in cleanup_paths:
                 with suppress(OSError):
-                    os.unlink(p)
+                    os.unlink(path)
 
-    async def _deliver_voice_reply(self, event: MessageEvent, audio_paths: List[str]) -> None:
-        """Play the files in the connected voice channel, else send them as voice messages."""
-        adapter = self._delivery_adapter_for(event.source)
-        guild_id = self._get_guild_id(event)
-        play = getattr(adapter, "play_in_voice_channel", None)
-        is_in_vc = getattr(adapter, "is_in_voice_channel", None)
-        if guild_id and callable(play) and callable(is_in_vc) and is_in_vc(guild_id):
+    def _voice_adapter_for_source(self, source) -> object:
+        """Resolve the adapter that should speak for ``source``.
+
+        Upstream renamed ``_adapter_for_source`` to ``_delivery_adapter_for``
+        (the profile-scoped resolver). Older doubles and any caller that still
+        carries the old name are supported, so the two existing call sites and
+        the delivery task share one lookup instead of three ad-hoc getattrs.
+        """
+        for attr in ("_delivery_adapter_for", "_adapter_for_source"):
+            resolver = getattr(self, attr, None)
+            if resolver is not None:
+                return resolver(source)
+        raise AttributeError(
+            "GatewayRunner exposes neither _delivery_adapter_for nor "
+            "_adapter_for_source; cannot resolve a voice adapter"
+        )
+
+    def _spawn_voice_delivery(
+        self, event: MessageEvent, audio_paths: List[str], *, ticket: Optional[int] = None
+    ) -> None:
+        """Compatibility seam for callers that already synthesized audio."""
+        task = asyncio.create_task(self._deliver_voice_reply(event, audio_paths, ticket=ticket))
+        _PENDING_VOICE_DELIVERIES.add(task)
+        task.add_done_callback(_PENDING_VOICE_DELIVERIES.discard)
+
+    async def _deliver_voice_reply(
+        self, event: MessageEvent, audio_paths: List[str], *, ticket: Optional[int] = None
+    ) -> bool:
+        """Play connected-Discord files on FIFO, else send native voice messages."""
+        queue_owned: set = set()
+        try:
+            adapter = self._voice_adapter_for_source(event.source)
+            guild_id = self._get_guild_id(event)
+            play = getattr(adapter, "play_in_voice_channel", None)
+            is_in_vc = getattr(adapter, "is_in_voice_channel", None)
+            if guild_id and callable(is_in_vc) and is_in_vc(guild_id) is True:
+                enqueue_batch = getattr(adapter, "enqueue_voice_speech_batch", None)
+                if callable(enqueue_batch):
+                    accepted = bool(enqueue_batch(guild_id, audio_paths, ticket=ticket))
+                    if accepted:
+                        queue_owned.update(audio_paths)
+                    return accepted
+                enqueue = getattr(adapter, "enqueue_voice_speech", None)
+                if callable(enqueue):
+                    accepted_any = False
+                    for path in audio_paths:
+                        accepted = (
+                            enqueue(guild_id, path) if ticket is None
+                            else enqueue(guild_id, path, ticket=ticket)
+                        )
+                        if accepted:
+                            accepted_any = True
+                            queue_owned.add(path)
+                            ticket = None
+                    return accepted_any
+                if callable(play):
+                    for path in audio_paths:
+                        await play(guild_id, path)
+                    return False
+            if not callable(send_voice := getattr(adapter, "send_voice", None)):
+                return False
+            reply_anchor = self._reply_anchor_for_event(event)
+            # notify=True mirrors the final-text path in platforms/base.py so notification-gating
+            # adapters (Telegram "important" mode) deliver it. Clone: shared w/ typing-indicator state.
+            thread_meta = dict(self._thread_metadata_for_source(event.source, reply_anchor) or {})
+            thread_meta["notify"] = True
             for path in audio_paths:
-                await play(guild_id, path)
-            return
-        if not callable(send_voice := getattr(adapter, "send_voice", None)):
-            return
-        reply_anchor = self._reply_anchor_for_event(event)
-        # notify=True mirrors the final-text path in platforms/base.py so notification-gating
-        # adapters (Telegram "important" mode) deliver it. Clone: shared w/ typing-indicator state.
-        thread_meta = dict(self._thread_metadata_for_source(event.source, reply_anchor) or {})
-        thread_meta["notify"] = True
-        for path in audio_paths:
-            await send_voice(chat_id=event.source.chat_id, audio_path=path, reply_to=reply_anchor,
-                             metadata=thread_meta)
+                await send_voice(chat_id=event.source.chat_id, audio_path=path, reply_to=reply_anchor,
+                                 metadata=thread_meta)
+            return False
+        except Exception as e:
+            logger.warning("Voice delivery failed: %s", e, exc_info=True)
+            return False
+        finally:
+            for path in audio_paths:
+                if path not in queue_owned:
+                    with suppress(OSError):
+                        os.unlink(path)

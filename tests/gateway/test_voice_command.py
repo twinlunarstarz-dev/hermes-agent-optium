@@ -1,5 +1,6 @@
 """Tests for the /voice command and auto voice reply in the gateway."""
 
+import asyncio
 import importlib.util
 import json
 import os
@@ -303,11 +304,16 @@ class TestSendVoiceReply:
         tts_result = json.dumps({"success": True, "file_path": "/tmp/test.ogg"})
 
         with patch("tools.tts_tool.text_to_speech_tool", return_value=tts_result) as mock_tts, \
-             patch("tools.tts_text_normalize._strip_markdown_for_tts", side_effect=lambda t: t), \
+             patch("tools.tts_text_normalize.prepare_spoken_text", side_effect=lambda t, **_: t), \
              patch("os.path.isfile", return_value=True), \
              patch("os.unlink"), \
              patch("os.makedirs"):
             await runner._send_voice_reply(event, "Hello world")
+            # Delivery is fire-and-forget now: drain the spawned task before leaving the patch.
+            import gateway.run_voice as _rv
+            _pending = list(getattr(_rv, "_PENDING_VOICE_DELIVERIES", set()))
+            if _pending:
+                await asyncio.gather(*_pending, return_exceptions=True)
 
         mock_adapter.send_voice.assert_called_once()
         assert mock_tts.call_args.kwargs["output_path"].endswith(".ogg")
@@ -331,11 +337,16 @@ class TestSendVoiceReply:
         tts_result = json.dumps({"success": True, "file_path": "/tmp/test.ogg"})
 
         with patch("tools.tts_tool.text_to_speech_tool", return_value=tts_result), \
-             patch("tools.tts_text_normalize._strip_markdown_for_tts", side_effect=lambda t: t), \
+             patch("tools.tts_text_normalize.prepare_spoken_text", side_effect=lambda t, **_: t), \
              patch("os.path.isfile", return_value=True), \
              patch("os.unlink"), \
              patch("os.makedirs"):
             await runner._send_voice_reply(event, "Hello world")
+        # Delivery is fire-and-forget now: drain the spawned task before asserting.
+        import gateway.run_voice as _rv
+        _pending = list(getattr(_rv, "_PENDING_VOICE_DELIVERIES", set()))
+        if _pending:
+            await asyncio.gather(*_pending, return_exceptions=True)
 
         mock_adapter.send_voice.assert_called_once()
         call_kwargs = mock_adapter.send_voice.call_args.kwargs
@@ -1004,6 +1015,80 @@ class TestStopAcquiresLock:
 
 
 # =====================================================================
+# Bug 2: _packet_debug_count must be instance-level, not class-level
+# =====================================================================
+
+class TestPacketDebugCounterIsInstanceLevel:
+    """Each VoiceReceiver instance has its own debug counter."""
+
+    @staticmethod
+    def _make_receiver():
+        from plugins.platforms.discord.adapter import VoiceReceiver
+        vc = MagicMock()
+        vc._connection.secret_key = [0] * 32
+        vc._connection.dave_session = None
+        vc._connection.ssrc = 1
+        return VoiceReceiver(vc)
+
+    def test_counter_is_per_instance(self):
+        """Two receivers have independent counters."""
+        r1 = self._make_receiver()
+        r2 = self._make_receiver()
+
+        r1._packet_debug_count = 10
+        assert r2._packet_debug_count == 0, \
+            "_packet_debug_count must be instance-level, not shared across instances"
+
+
+# =====================================================================
+# Bug 3: play_in_voice_channel uses get_running_loop not get_event_loop
+# =====================================================================
+
+class TestPlayInVoiceChannelUsesRunningLoop:
+    """play_in_voice_channel must use asyncio.get_running_loop()."""
+
+    def test_source_uses_get_running_loop(self):
+        """The method source code calls get_running_loop, not get_event_loop."""
+        import inspect
+        from plugins.platforms.discord.adapter import DiscordAdapter
+        source = inspect.getsource(DiscordAdapter.play_in_voice_channel)
+        assert "get_running_loop" in source, \
+            "play_in_voice_channel should use asyncio.get_running_loop()"
+        assert "get_event_loop" not in source, \
+            "play_in_voice_channel should NOT use deprecated asyncio.get_event_loop()"
+
+
+# =====================================================================
+# Bug 4: _send_voice_reply filename uses uuid (no collision)
+# =====================================================================
+
+class TestSendVoiceReplyFilename:
+    """_send_voice_reply uses uuid for unique filenames."""
+
+    def test_filename_uses_uuid(self):
+        """The path builder uses uuid in the filename, not time-based.
+
+        Filename construction moved into build_auto_tts_output_path
+        (gateway/platforms/base.py) when the path became platform-aware;
+        the uniqueness contract lives there now.
+        """
+        import inspect
+        from gateway.platforms.base import build_auto_tts_output_path
+        from gateway.run import GatewayRunner
+        source = inspect.getsource(build_auto_tts_output_path)
+        assert "uuid" in source, \
+            "build_auto_tts_output_path should use uuid for unique filenames"
+        assert "int(time.time())" not in source, \
+            "build_auto_tts_output_path should not use int(time.time()) — collision risk"
+        runner_source = inspect.getsource(GatewayRunner._send_voice_reply)
+        prepare_source = inspect.getsource(GatewayRunner._prepare_voice_reply_delivery)
+        assert "build_auto_tts_output_path" in prepare_source, \
+            "the background synthesis task should build its path via build_auto_tts_output_path"
+        assert "_prepare_voice_reply_delivery" in runner_source, \
+            "_send_voice_reply must hand synthesis to the background task"
+
+
+# =====================================================================
 # Bug 5: Voice timeout cleans up runner voice_mode via callback
 # =====================================================================
 
@@ -1120,6 +1205,59 @@ class TestPlaybackTimeout:
             mock_vc.stop.assert_called()
         finally:
             DiscordAdapter.PLAYBACK_TIMEOUT = original_timeout
+
+
+# =====================================================================
+# Bug 7: _send_voice_reply cleanup in finally block
+# =====================================================================
+
+class TestSendVoiceReplyCleanup:
+    """_send_voice_reply must clean up temp files even on exception."""
+
+    def test_cleanup_in_finally(self):
+        """Temp-file cleanup survives the fire-and-forget refactor: the delivery task
+        (``_deliver_voice_reply``) owns the unlink in its own finally block."""
+        import inspect
+        from gateway.run import GatewayRunner
+
+        # The handoff must exist and the caller must NOT unlink inline.
+        reply_src = inspect.getsource(GatewayRunner._send_voice_reply)
+        assert "_prepare_voice_reply_delivery" in reply_src, \
+            "_send_voice_reply must hand synthesis and delivery to the background task"
+        assert "os.unlink" not in reply_src, \
+            "_send_voice_reply must not unlink inline — the background task owns the files"
+
+        # The background synthesis task performs cleanup in its finally block.
+        prepare_src = inspect.getsource(GatewayRunner._prepare_voice_reply_delivery)
+        assert "finally" in prepare_src and "unlink" in prepare_src, \
+            "_prepare_voice_reply_delivery must unlink retained audio paths in a finally block"
+        # The delivery task also cleans native-voice-message fallback files it does not enqueue.
+        deliver_src = inspect.getsource(GatewayRunner._deliver_voice_reply)
+        assert "finally" in deliver_src and "unlink" in deliver_src, \
+            "_deliver_voice_reply must unlink the audio files in a finally block"
+
+
+# =====================================================================
+# Bug 8: Base adapter auto-TTS cleans up temp file after play_tts
+# =====================================================================
+
+class TestAutoTtsTempFileCleanup:
+    """Base adapter auto-TTS must clean up generated audio file."""
+
+    def test_source_has_finally_remove(self):
+        """play_tts call is wrapped in try/finally with os.remove."""
+        import inspect
+        from gateway.platforms.base import BasePlatformAdapter
+        source = inspect.getsource(BasePlatformAdapter._process_message_background)
+        # Find the play_tts section and verify cleanup
+        play_tts_idx = source.find("play_tts")
+        assert play_tts_idx > 0
+        after_play = source[play_tts_idx:]
+        finally_idx = after_play.find("finally")
+        remove_idx = after_play.find("os.remove")
+        assert finally_idx > 0, "play_tts must be in a try/finally block"
+        assert remove_idx > 0, "finally block must call os.remove on _tts_path"
+        assert remove_idx > finally_idx, "os.remove must be inside the finally block"
 
 
 # =====================================================================

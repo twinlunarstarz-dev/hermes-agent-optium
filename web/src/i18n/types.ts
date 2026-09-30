@@ -420,6 +420,13 @@ export interface Translations {
     skills: string;
     rename: string;
     editSoul: string;
+    editVoice: string;
+    voiceSection: string;
+    voiceCloneEnabled: string;
+    voiceCloneHint: string;
+    voiceRefAudio: string;
+    voiceRefText: string;
+    voiceSaved: string;
     soulSection: string;
     soulPlaceholder: string;
     saveSoul: string;

@@ -123,6 +123,82 @@ _SCHEMA_OVERRIDES: Dict[str, Dict[str, Any]] = {
         "Text-to-speech provider",
         "edge", "elevenlabs", "openai", "xai", "minimax", "mistral", "gemini", "neutts", "kittentts", "piper",
     ),
+    # --- Qwen3-TTS (local, plugin-registered as "qwen3-tts") ------------------
+    # The plugin reads `tts.qwen3_tts.*`; the registry name is "qwen3-tts" but the
+    # config block is underscored, matching the existing tts.neutts.* convention.
+    "tts.qwen3_tts.voice_cloning.enabled": {
+        "type": "boolean",
+        "description": (
+            "Clone a voice from a reference clip instead of designing one from a text "
+            "description. Requires the Base checkpoint in voice_cloning.model_dir."
+        ),
+        "category": "tts",
+    },
+    "tts.qwen3_tts.voice_cloning.ref_audio": {
+        "type": "string",
+        "description": (
+            "Path to the reference recording to clone (mono 24 kHz works best). "
+            "Swap it to change voice without restarting Hermes."
+        ),
+        "category": "tts",
+    },
+    "tts.qwen3_tts.voice_cloning.ref_text": {
+        "type": "string",
+        "description": (
+            "Path to a text file with the exact transcript of the reference audio, "
+            "or the transcript text itself."
+        ),
+        "category": "tts",
+    },
+    "tts.qwen3_tts.voice_cloning.model_dir": {
+        "type": "string",
+        "description": "Qwen3-TTS Base checkpoint used for cloning (voice cloning needs Base).",
+        "category": "tts",
+    },
+    "tts.qwen3_tts.voice_cloning.mode": _select(
+        "Voice cloning mode", "x_vector_only", "full", category="tts"
+    ),
+    "tts.qwen3_tts.voice_cloning.seed": {
+        "type": "number",
+        "description": "Seed for reproducible cloned speech.",
+        "category": "tts",
+    },
+    "tts.qwen3_tts.base_voice": {
+        "type": "string",
+        "description": (
+            "Natural-language voice description used when cloning is off. "
+            "This is the VoiceDesign path, where audio tags also apply."
+        ),
+        "category": "tts",
+    },
+    "tts.qwen3_tts.personality": {
+        "type": "string",
+        "description": "Fallback personality name when no personality is active at runtime.",
+        "category": "tts",
+    },
+    "tts.qwen3_tts.language": {
+        "type": "string",
+        "description": "Language hint passed to the model (e.g. English).",
+        "category": "tts",
+    },
+    "tts.qwen3_tts.model_dir": {
+        "type": "string",
+        "description": "Qwen3-TTS checkpoint directory (VoiceDesign variant).",
+        "category": "tts",
+    },
+    "tts.qwen3_tts.stream_batch_size": {
+        "type": "number",
+        "description": (
+            "Sentences per model call while streaming. 1 gives the fastest first audio; "
+            "higher values (4-8) are much faster overall."
+        ),
+        "category": "tts",
+    },
+    "tts.qwen3_tts.timeout_seconds": {
+        "type": "number",
+        "description": "Per-sentence synthesis timeout. Raise it for slow first-load (cold model).",
+        "category": "tts",
+    },
     # "mistral" temporarily removed — mistralai PyPI package quarantined
     # (malicious 2.4.6 release on 2026-05-12). Restore once available.
     "stt.provider": _select("Speech-to-text provider", "local", "groq", "openai", "xai", "elevenlabs"),

@@ -45,8 +45,11 @@ from starlette.concurrency import run_in_threadpool
 from hermes_cli.web_models import (
     ProfileCreate, ProfileActiveUpdate, ProfileExport, ProfileImport, ProfileRename,
     ProfileSoulUpdate, ProfileDescriptionUpdate, ProfileModelUpdate, ProfileDescribeAuto,
-    SessionPrScanBody)
-from hermes_cli.web_server_profiles import _config_profile_scope, _hermes_home_scope
+    ProfileVoiceUpdate, SessionPrScanBody)
+from hermes_cli.web_server_profiles import (
+    _config_profile_scope,
+    _hermes_home_scope,
+)
 
 # Same logger the handlers used before extraction (identical logger object).
 _log = logging.getLogger("hermes_cli.web_server")
@@ -1052,6 +1055,75 @@ async def update_profile_model_endpoint(name: str, body: ProfileModelUpdate):
                          not_found=(), bad_request=()):
         await run_in_threadpool(_write_profile_model, profile_dir, provider, model)
     return {"ok": True, "provider": provider, "model": model}
+
+
+# ---- Per-profile Qwen3-TTS voice clone -------------------------------------
+# Each profile speaks in its own cloned voice, so the reference clip is a
+# per-profile setting under tts.qwen3_tts.voice_cloning. Read and write it
+# through the profile's own config.yaml via _hermes_home_scope, matching how
+# MCP servers are written per profile.
+
+_VOICE_CLONE_KEYS = ("enabled", "ref_audio", "ref_text", "model_dir", "mode", "seed")
+
+
+def _read_profile_voice(profile_dir) -> Dict[str, Any]:
+    """Current voice-clone settings for a profile (never raises)."""
+    from hermes_cli.config import load_config
+    with _hermes_home_scope(profile_dir):
+        cfg = load_config()
+    q = ((cfg.get("tts") or {}).get("qwen3_tts") or {})
+    clone = dict(q.get("voice_cloning") or {})
+    return {
+        "provider": (cfg.get("tts") or {}).get("provider") or "",
+        "clone": {k: clone.get(k) for k in _VOICE_CLONE_KEYS},
+        "base_voice": q.get("base_voice") or "",
+        "model_dir": q.get("model_dir") or "",
+    }
+
+
+@router.get("/api/profiles/{name}/voice")
+async def get_profile_voice(name: str):
+    """This profile's Qwen3-TTS voice-clone settings."""
+    profile_dir = _resolve_profile_dir(name)
+
+    def _run() -> Dict[str, Any]:
+        return _read_profile_voice(profile_dir)
+
+    return {"ok": True, **_run()}
+
+
+@router.put("/api/profiles/{name}/voice")
+async def update_profile_voice(name: str, body: ProfileVoiceUpdate):
+    """Update this profile's voice clone. Omitted fields keep their value.
+
+    Enabling cloning without a reference clip is rejected: the worker would fall
+    back to voice design and the profile would silently speak in the wrong voice.
+    """
+    profile_dir = _resolve_profile_dir(name)
+
+    def _run() -> Dict[str, Any]:
+        from hermes_cli.config import load_config, save_config
+        with _hermes_home_scope(profile_dir):
+            cfg = load_config()
+            q = ((cfg.setdefault("tts", {})).setdefault("qwen3_tts", {}))
+            clone = q.setdefault("voice_cloning", {})
+
+            updates = {k: v for k, v in body.model_dump().items()
+                       if v is not None and k != "base_voice"}
+            if body.base_voice is not None:
+                q["base_voice"] = body.base_voice
+
+            if updates.get("enabled") is True:
+                ref = updates.get("ref_audio") or clone.get("ref_audio") or ""
+                if not str(ref).strip():
+                    raise ValueError(
+                        "voice cloning needs a reference clip: set ref_audio first")
+            clone.update(updates)
+            save_config(cfg)
+        return _read_profile_voice(profile_dir)
+
+    with _profile_errors("PUT /api/profiles/%s/voice failed", name):
+        return {"ok": True, **(await run_in_threadpool(_run))}
 
 
 @router.post("/api/profiles/{name}/describe-auto")

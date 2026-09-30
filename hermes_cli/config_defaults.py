@@ -1154,6 +1154,29 @@ DEFAULT_CONFIG = {
             "voice": "default",
             # optional "base_url" key overrides DEEPINFRA_BASE_URL for TTS only
         },
+        # Qwen3-TTS: local GPU TTS from the "qwen3-tts" plugin. Two modes:
+        # voice design (natural-language `base_voice`) and voice cloning
+        # (`voice_cloning`, which needs the Base checkpoint). Present here so the
+        # dashboard renders an editable section for it.
+        # Defaults mirror the live default profile's voice, so a new profile
+        # inherits the voice the user already approved rather than a disabled
+        # placeholder. Per-profile overrides (e.g. a different ref_audio) win.
+        "qwen3_tts": {
+            "model_dir": "/models/qwen3-tts",  # VoiceDesign checkpoint
+            "base_voice": "neutral, calm, clear",  # used when cloning is off
+            "personality": "technical",  # fallback when none is active at runtime
+            "language": "English",
+            "stream_batch_size": 4,  # sentences per model call while streaming
+            "timeout_seconds": 300,  # raise for the cold first load
+            "voice_cloning": {
+                "enabled": True,
+                "model_dir": "/models/qwen3-tts-base",  # Base checkpoint (required to clone)
+                "ref_audio": "/models/voice-samples/default.wav",
+                "ref_text": "/models/voice-samples/default.txt",
+                "mode": "x_vector_only",
+                "seed": 0,
+            },
+        },
     },
 
     "stt": {

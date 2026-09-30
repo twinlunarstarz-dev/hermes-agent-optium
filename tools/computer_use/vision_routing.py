@@ -23,15 +23,29 @@ from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
-def _explicit_aux_vision_override(cfg: Optional[Dict[str, Any]]) -> bool:
-    """True when ``auxiliary.vision`` carries a non-default user override; mirrors ``agent.image_routing`` so the capture
-    and user-attached-image paths agree. ``provider: "auto"``, blanks or a missing block are *not* explicit."""
-    aux = cfg.get("auxiliary") if isinstance(cfg, dict) else None
-    vision = aux.get("vision") if isinstance(aux, dict) else None
-    if not isinstance(vision, dict):
-        return False
-    provider = str(vision.get("provider") or "").strip().lower()
-    return provider not in ("", "auto") or any(str(vision.get(k) or "").strip() for k in ("model", "base_url"))
+def _explicit_aux_vision_override(
+    cfg: Optional[Dict[str, Any]], provider: str = "", model: str = ""
+) -> bool:
+    """True when the configured aux vision route is a distinct image route.
+
+    Delegate identity resolution to ``agent.image_routing`` so screenshots,
+    attached images, and ``vision_analyze`` all use the same policy.  The
+    provider/model arguments are optional to preserve this module's internal
+    test surface; callers should pass the active route for same-model detection.
+    """
+    try:
+        from agent.image_routing import _explicit_aux_vision_override as shared
+        return shared(cfg, provider, model)
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.debug("computer_use vision_routing: shared aux-vision policy lookup failed: %s", exc)
+        aux = cfg.get("auxiliary") if isinstance(cfg, dict) else None
+        vision = aux.get("vision") if isinstance(aux, dict) else None
+        if not isinstance(vision, dict):
+            return False
+        provider_name = str(vision.get("provider") or "").strip().lower()
+        return provider_name not in ("", "auto") or any(
+            str(vision.get(k) or "").strip() for k in ("model", "base_url")
+        )
 
 def _lookup_user_declared_supports_vision(provider: str, model: str, cfg: Optional[Dict[str, Any]]) -> Optional[bool]:
     """Config-declared ``supports_vision`` for the active route (None on failure)."""
@@ -64,7 +78,7 @@ def should_route_capture_to_aux_vision(provider: str, model: str, cfg: Optional[
     # native vision (maintainer decision, 2026-08-28, reversing #29135's fallback-only posture: config that
     # only takes effect when the main model gets worse is a trap, not a setting). Native vision remains the
     # default for unconfigured installs, and the fallback when the aux backend is unset.
-    if _explicit_aux_vision_override(cfg):
+    if _explicit_aux_vision_override(cfg, provider, model):
         return True
     user_declared = _lookup_user_declared_supports_vision(provider, model, cfg)
     if isinstance(user_declared, bool):  # True → multimodal, False → aux

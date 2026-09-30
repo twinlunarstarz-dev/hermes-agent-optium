@@ -418,13 +418,14 @@ ASYNC_HANDOFF_GUIDANCE = (
 # cline/cline#11514 ("encourage parallel tool calls"), adapted from Cline's TypeScript tool-surface guidance
 # to hermes-agent's Python prompt-assembly architecture.
 PARALLEL_TOOL_CALL_GUIDANCE = (
-    "# Parallel tool calls\n"
-    "When you need several pieces of information that don't depend on each other, request them together in a "
-    "single response instead of one tool call per turn. Independent reads, searches, web fetches, and "
-    "read-only commands should be batched into the same assistant turn — the runtime executes independent "
-    "calls concurrently, and batching avoids resending the whole conversation on every extra round-trip.\n"
-    "Only serialize calls when a later call genuinely depends on an earlier call's result (e.g. you must "
-    "read a file before you can patch it). When in doubt and the calls are independent, batch them."
+    "# Batching multiple tool calls\n"
+    "Native tools are single-call: invoke one at a time and wait for its result. When you need several\n"
+    "INDEPENDENT calls, do not fan them out as parallel native calls — batch them inside `execute_code`\n"
+    "in a single turn, which is exactly what it is for (its sandbox covers web_search, web_extract,\n"
+    "read_file, write_file, search_files, patch, and terminal; it cannot reach MCP/plugin tools, so those\n"
+    "stay native single calls). Batching avoids resending the whole conversation on every extra\n"
+    "round-trip. Only sequence a call when a later one genuinely depends on an earlier result (e.g. you\n"
+    "must read a file before you can patch it). Never batch dependent or competing operations."
 )
 
 # Execution-discipline guidance for models that abandon partial results, skip prerequisite lookups, answer

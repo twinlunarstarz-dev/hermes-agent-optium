@@ -5,7 +5,7 @@ import json
 import pytest
 
 from gateway.config import GatewayConfig, Platform
-from gateway.platforms.event import MessageEvent
+from gateway.platforms.event import MessageEvent, MessageType
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource
 
@@ -70,6 +70,32 @@ async def test_busy_injection_preserves_original_routing_fields(route, platform,
     assert origin == expected
     assert asdict(source) == original_source
     assert event.text == ("/steer request" if route == "explicit" else "request")
+
+
+@pytest.mark.asyncio
+async def test_busy_voice_transcript_steers_active_run(tmp_path, monkeypatch):
+    monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
+    (tmp_path / "config.yaml").write_text("privacy:\n  redact_pii: false\n", encoding="utf-8")
+    runner = GatewayRunner(config=GatewayConfig())
+    source = SessionSource(platform=Platform.DISCORD, chat_id="channel", thread_id="thread", user_id="user")
+    event = MessageEvent(
+        text="Use the safer approach instead.", source=source,
+        message_type=MessageType.VOICE,
+    )
+
+    class Receiver:
+        payload = None
+
+        def steer(self, text):
+            self.payload = text
+            return True
+
+    receiver = Receiver()
+    outcome = await runner._resolve_busy_steer_or_redirect(event, "key", "steer", receiver)
+
+    assert outcome.steered is True
+    assert outcome.effective_mode == "steer"
+    assert receiver.payload.endswith("\n\nUse the safer approach instead.")
 
 
 def test_origin_is_lossless_data_not_new_prompt_lines_or_a_guessed_target():

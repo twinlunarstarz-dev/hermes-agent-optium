@@ -66,6 +66,34 @@ class TestDecideImageInputMode:
         with patch("agent.image_routing._lookup_supports_vision", return_value=True):
             assert decide_image_input_mode("anthropic", "claude-sonnet-4", cfg) == "text"
 
+    def test_auto_explicit_same_provider_model_routes_native(self):
+        """An aux block naming the active route must not force a redundant call."""
+        cfg = {"auxiliary": {"vision": {"provider": "openrouter", "model": "anthropic/claude-sonnet-4"}}}
+        with patch("agent.image_routing._lookup_supports_vision", return_value=True):
+            assert decide_image_input_mode("openrouter", "anthropic/claude-sonnet-4", cfg) == "native"
+
+    def test_auto_same_named_model_on_different_endpoint_routes_text(self):
+        cfg = {
+            "model": {"base_url": "https://main.example/v1"},
+            "auxiliary": {"vision": {
+                "provider": "custom", "model": "same-model", "base_url": "https://aux.example/v1",
+            }},
+        }
+        with patch("agent.image_routing._lookup_supports_vision", return_value=True):
+            assert decide_image_input_mode("custom", "same-model", cfg) == "text"
+
+    def test_auto_provider_alias_same_route_routes_native(self):
+        cfg = {"auxiliary": {"vision": {"provider": "google", "model": "gemini-3-pro"}}}
+        with patch("agent.image_routing._lookup_supports_vision", return_value=True):
+            assert decide_image_input_mode("gemini", "gemini-3-pro", cfg) == "native"
+
+    def test_auto_custom_requested_provider_name_matches_canonical_route(self):
+        cfg = {"auxiliary": {"vision": {"provider": "custom:local-vlm", "model": "vision-model"}}}
+        with patch("agent.image_routing._lookup_supports_vision", return_value=True):
+            assert decide_image_input_mode(
+                "custom", "vision-model", cfg, requested_provider="local-vlm"
+            ) == "native"
+
     def test_auto_unset_aux_backend_native_remains_default(self):
         """No configured aux backend -> native for vision-capable mains
         (the unconfigured-install default is unchanged)."""

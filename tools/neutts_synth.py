@@ -3,8 +3,8 @@
 
 Called by tts_tool via subprocess so the ~500MB TTS model lives in a process that exits
 after synthesis. Usage:
-    python -m tools.neutts_synth --text "Hello" --out out.wav --ref-audio jo.wav --ref-text jo.txt
-Run ``hermes setup tts`` and choose NeuTTS; espeak-ng is also required (apt/brew).
+    python -m tools.neutts_synth --text "Hello" --out out.wav --ref-audio jo.wav --ref-text jo.txt --language en-us
+Requires ``pip install -U neutts[all]`` and espeak-ng (apt/brew).
 """
 
 import argparse
@@ -35,6 +35,8 @@ def main():
     parser.add_argument("--model", default="neuphonic/neutts-air-q4-gguf",
                         help="HuggingFace backbone model repo")
     parser.add_argument("--device", default="cpu", help="Device (cpu/cuda/mps)")
+    parser.add_argument("--language", default=None,
+                        help="eSpeak language code for custom backbones (for example en-us)")
     args = parser.parse_args()
 
     ref_audio = Path(args.ref_audio).expanduser()
@@ -56,11 +58,14 @@ def main():
     # llama_cpp (backbone) offloads to GPU only for the literal string "gpu";
     # torch (codec) only accepts "cuda". A single --device value can't satisfy
     # both — "cuda" silently no-ops on the backbone, leaving it on CPU.
+    # Always pass language to suppress NeuTTS warning about eSpeak language code
+    language = args.language or "en-us"
     tts = NeuTTS(
         backbone_repo=args.model,
         backbone_device="gpu" if args.device == "cuda" else args.device,
         codec_repo="neuphonic/neucodec",
-        codec_device=args.device)
+        codec_device=args.device,
+        language=language)
     wav = tts.infer(args.text, tts.encode_reference(str(ref_audio)), ref_text)
 
     out_path = Path(args.out)

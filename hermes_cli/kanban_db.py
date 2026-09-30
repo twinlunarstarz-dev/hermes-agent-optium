@@ -2425,9 +2425,10 @@ def release_stale_claims(
 
     A host-local worker that is still alive gets its claim *extended* instead
     (a slow model can sit longer than the TTL inside one tool-free call, so no
-    heartbeat) — unless ``last_heartbeat_at`` is older than
-    ``DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS`` (wedged; ``_touch_activity``
-    keeps any genuinely active worker fresh). Safe to call often.
+    heartbeat) — only when ``last_heartbeat_at`` is recent. A missing or stale
+    heartbeat is evidence of no observable progress and is reclaimed even if
+    the PID is alive; ``_touch_activity`` keeps genuinely active workers fresh.
+    Safe to call often.
 
     Reclaiming a live worker mid-flight produces the spawn- then-immediately-reclaim loop seen on slow
     models that spend longer than ``DEFAULT_CLAIM_TTL_SECONDS`` inside a single tool-free LLM call (#23025):
@@ -2454,9 +2455,15 @@ def release_stale_claims(
     for row in stale:
         host_local = (row["claim_lock"] or "").startswith(host_prefix)
         hb = row["last_heartbeat_at"]
-        # Backstop: a heartbeat older than the max-stale threshold means no
-        # observable progress — reclaim even if the PID is alive (logic loop).
-        heartbeat_stale = hb is not None and (now - int(hb)) > DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS
+        # Backstop: no heartbeat, or one older than the max-stale threshold, means no
+        # observable progress.  A live PID alone is not liveness evidence: treating
+        # NULL as fresh allowed a silent worker to extend an already-expired claim
+        # forever.  Upstream also added worker_started_at so a recycled PID is not
+        # mistaken for the original worker.
+        heartbeat_stale = (
+            hb is None
+            or (now - int(hb)) > DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS
+        )
         started_at = _row_get(row, "worker_started_at")
         if (host_local and row["worker_pid"] and _worker_alive(row["worker_pid"], started_at)
                 and not heartbeat_stale):

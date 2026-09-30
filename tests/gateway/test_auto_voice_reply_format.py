@@ -1,15 +1,24 @@
 """Tests for gateway auto-TTS voice reply audio format selection."""
 
+import asyncio
 import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+import gateway.run_voice as gateway_run_voice
 from gateway.config import Platform
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource
+
+
+async def _drain_pending_voice_deliveries():
+    """Await all spawned fire-and-forget voice-delivery tasks (test-only drain)."""
+    pending = list(getattr(gateway_run_voice, "_PENDING_VOICE_DELIVERIES", set()))
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
 
 
 class TestAutoVoiceReplyFormat:
@@ -47,6 +56,7 @@ class TestAutoVoiceReplyFormat:
 
         with patch("tools.tts_tool.text_to_speech_tool", side_effect=fake_tts):
             await runner._send_voice_reply(event, "hello from auto tts")
+            await _drain_pending_voice_deliveries()
 
         assert requested_paths and requested_paths[0].endswith(".ogg")
         adapter.send_voice.assert_awaited_once()

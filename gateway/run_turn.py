@@ -21,6 +21,7 @@ from agent.session_activity import format_iteration_progress
 from agent.turn_failure_copy import FAILED_TURN_DISPLAY_KIND, FAILED_TURN_NOTICE, PARTIAL_FAILED_TURN_NOTICE
 from contextlib import nullcontext, suppress
 from contextvars import copy_context
+from types import SimpleNamespace
 from gateway.config import Platform
 from gateway.media_repair import repair_explicit_computer_use_media_paths
 from gateway.platforms.base import BasePlatformAdapter, ProcessingOutcome
@@ -3694,6 +3695,50 @@ class GatewayTurnMixin:
             pending = None
         return pending_event, pending
 
+    async def _speak_queued_first_response(
+        self, turn_ctx: TurnContext, first_response: str, adapter: Any,
+    ) -> None:
+        """Speak the interrupted turn's first response on the unified FIFO voice queue.
+
+        Rebuilds a synthetic MessageEvent from turn-context fields (the original event object
+        is not carried into the queued-follow-up path) so the existing voice-reply gates and
+        the ticket-reserving queue path apply unchanged. Text-only lanes and voice-off chats
+        exit through the same ``_should_send_voice_reply`` gates as the normal final."""
+        from gateway.platforms.event import MessageEvent, MessageType
+        source = turn_ctx.source
+        if source is None:
+            return
+        _mt_raw = turn_ctx.message_type
+        try:
+            _mt = MessageType(_mt_raw) if _mt_raw else MessageType.TEXT
+        except ValueError:
+            _mt = MessageType.TEXT
+        _guild_id = turn_ctx.voice_guild_id
+        if _guild_id is None:
+            # Derive from the adapter's voice binding (chat_id -> guild), the same source of
+            # truth play_tts uses; the turn context may not carry the inbound event's guild.
+            _bindings = getattr(adapter, "_voice_text_channels", None) or {}
+            _gid = next((g for g, ch in _bindings.items()
+                         if str(ch) == str(getattr(source, "chat_id", ""))), None)
+            _guild_id = int(_gid) if _gid is not None else None
+        _raw = SimpleNamespace(guild_id=_guild_id, guild=None) if _guild_id else None
+        _event = MessageEvent(
+            source=source, text=first_response, message_type=_mt, raw_message=_raw,
+        )
+        _agent_messages = [{"role": "user", "content": turn_ctx.message or ""},
+                           {"role": "assistant", "content": first_response}]
+        # already_sent=True: the queued lane delivers the TEXT itself right after this call, so
+        # the runner must own the speech — the voice-input "adapter auto-TTS handles it" gate
+        # does not apply here (that lane never runs for queued-first-response deliveries).
+        if not self._should_send_voice_reply(_event, first_response, _agent_messages, already_sent=True):
+            logger.debug(
+                "Queued first response not spoken (voice gates) for session %s", turn_ctx.session_key)
+            return
+        logger.info(
+            "Queued follow-up for session %s: speaking first response via voice queue.",
+            turn_ctx.session_key or "?")
+        await self._send_voice_reply(_event, first_response)
+
     async def _run_agent_deliver_first_response(
         self, turn_ctx: TurnContext, adapter: Any, response: Any, result: Any, stream_task: Any,
     ) -> None:
@@ -3731,6 +3776,11 @@ class GatewayTurnMixin:
         # Failed turns deliver their text but never their attachments (completed-turn parity).
         _deliver_media = not _delivery_result.get("failed")
         if first_response:
+            # Unified voice pipeline: the first (interrupted turn's) response must be spoken on
+            # the same FIFO queue as the normal final lane — before the queued follow-up turn
+            # starts reserving tickets — or it is silently text-only while later speech plays.
+            with suppress(Exception):
+                await self._speak_queued_first_response(turn_ctx, first_response, adapter)
             logger.info(
                 "Queued follow-up for session %s: final text delivery confirmed; delivering explicit media before continuing."
                 if _already_streamed else
@@ -4273,6 +4323,7 @@ class GatewayTurnMixin:
             persist_user_display_kind=persist_user_display_kind,
             reply_expected=reply_expected,
             persist_user_display_metadata=persist_user_display_metadata,
+            message_type=message_type,
             scheduled_heartbeat=scheduled_heartbeat,
         )
         _status_thread_metadata = self._run_agent_bind_turn_wiring(

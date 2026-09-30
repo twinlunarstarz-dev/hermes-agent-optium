@@ -827,6 +827,22 @@ export const api = {
         body: JSON.stringify({ content }),
       },
     ),
+  getProfileVoice: (name: string) =>
+    fetchJSON<ProfileVoiceResult>(
+      `/api/profiles/${encodeURIComponent(name)}/voice`,
+    ),
+  updateProfileVoice: (
+    name: string,
+    voice: Partial<ProfileVoiceClone> & { base_voice?: string },
+  ) =>
+    fetchJSON<ProfileVoiceResult>(
+      `/api/profiles/${encodeURIComponent(name)}/voice`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(voice),
+      },
+    ),
 
   // Skills & Toolsets
   //
@@ -2323,6 +2339,23 @@ export interface AnalyticsResponse {
 export interface ActiveProfileInfo {
   active: string;
   current: string;
+}
+
+export interface ProfileVoiceClone {
+  enabled: boolean | null;
+  ref_audio: string | null;
+  ref_text: string | null;
+  model_dir: string | null;
+  mode: string | null;
+  seed: number | null;
+}
+
+export interface ProfileVoiceResult {
+  ok: boolean;
+  provider: string;
+  clone: ProfileVoiceClone;
+  base_voice: string;
+  model_dir: string;
 }
 
 export interface ProfileDescribeAutoResult {

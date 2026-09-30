@@ -29,6 +29,8 @@ _MD_BLOCKQUOTE_RE = re.compile(r"^\s*>\s?", flags=re.MULTILINE)
 _MD_LIST_ITEM_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+", flags=re.MULTILINE)
 _MD_HR_RE = re.compile(r"^\s*[-*_]{3,}\s*$", flags=re.MULTILINE)
 _MD_TABLE_PIPE_RE = re.compile(r"\s*\|\s*")
+# URLs are READ aloud ("github dot com slash user slash repo"), not deleted —
+# trailing sentence punctuation is stripped in ``_url_to_spoken``, not by the regex.
 _URL_RE = re.compile(r"https?://\S+")
 # Local file links ("MEDIA:/Users/me/file.xlsx") are click targets on screen, not
 # speech: voices loop on the hyphenated slug ("eeeeee"). The token is silence; the
@@ -41,11 +43,27 @@ _DEGREE_UNITS = (("C", "Celsius"), ("F", "Fahrenheit"))
 _UNIT_WORDS = (
     (r"km\s*/\s*h", "kilometres per hour"), (r"km/h", "kilometres per hour"),
     (r"mm", "millimetres"), (r"cm", "centimetres"), (r"m", "metres"))
+# Capital magnitude suffixes after a number: "$1.5M" -> "1.5 million", "5K" -> "5 thousand".
+_MAGNITUDE_SUFFIXES = ((r"M", "million"), (r"K", "thousand"), (r"B", "billion"))
 # Currency prefix (regex) -> spoken word; order matters (NZ$/A$/US$ before bare $).
 _CURRENCY_WORDS = (
     (r"NZ\$", "New Zealand dollars", re.IGNORECASE), (r"A\$", "Australian dollars", re.IGNORECASE),
     (r"US\$", "US dollars", re.IGNORECASE), ("€", "euros", 0), ("£", "pounds", 0), (r"\$", "dollars", 0),
 )
+
+# Common technical abbreviations need explicit letter names for small TTS models.
+_SPOKEN_ABBREVIATIONS = (
+    (r"\bHTTPS\b", "H T T P S"), (r"\bHTTP\b", "H T T P"),
+    (r"\bAPIs\b", "A P I's"), (r"\bAPI\b", "A P I"),
+    (r"\bURLs\b", "U R Ls"), (r"\bURL\b", "U R L"),
+    (r"\bTTS\b", "T T S"), (r"\bSTT\b", "S T T"),
+    (r"\bLLM\b", "L L M"), (r"\bGPU\b", "G P U"), (r"\bCPU\b", "C P U"),
+    (r"\bCLI\b", "C L I"), (r"\bMCP\b", "M C P"), (r"\bJSON\b", "J S O N"),
+    (r"\bYAML\b", "Y A M L"), (r"\bSSH\b", "S S H"),
+    (r"\bFYI\b", "F Y I"), (r"\bETA\b", "E T A"),
+    (r"\bASAP\b", "as soon as possible"), (r"\bPR\b", "pull request"),
+)
+
 
 # Broad emoji / pictograph cleanup: most voice providers read emojis as awkward labels.
 _EMOJI_RE = re.compile(
@@ -56,6 +74,22 @@ _EMOJI_RE = re.compile(
 _VARIATION_SELECTOR_RE = re.compile("[︎️]")
 
 
+def _url_to_spoken(url: str) -> str:
+    """Turn a URL into words a TTS engine reads naturally: ``https://github.com/u/r.``
+    -> ``github dot com slash u slash r`` (trailing sentence punctuation dropped)."""
+    body = re.sub(r"^https?://", "", url, flags=re.IGNORECASE).rstrip(".,;:!?)>\"'”’]")
+    parts = []
+    for i, chunk in enumerate(body.split("/")):
+        if i > 0:
+            parts.append("slash")
+        if i == 0:
+            # Dots in the host are spoken: "github.com" -> "github dot com".
+            parts.append(re.sub(r"\.", " dot ", chunk.strip(".")))
+        elif chunk:
+            parts.append(chunk)
+    return " ".join(p for p in parts if p).strip()
+
+
 def strip_markdown_for_tts(text: str) -> str:
     """Strip Markdown/Telegram formatting while preserving readable words."""
     if not text:
@@ -64,14 +98,17 @@ def strip_markdown_for_tts(text: str) -> str:
     text = _MD_CODE_BLOCK_RE.sub(" ", text)
     text = _MD_IMAGE_RE.sub(lambda m: f" {m.group(1)} " if m.group(1) else " ", text)
     text = _MD_LINK_RE.sub(r"\1", text)
-    text = _URL_RE.sub("", text)
-    text = _MEDIA_PATH_RE.sub(" ", text)
+    text = _URL_RE.sub(lambda m: " " + _url_to_spoken(m.group(0)) + " ", text)
     text = _MD_INLINE_CODE_RE.sub(r"\1", text)
     text = _MD_BOLD_RE.sub(r"\1", text)
     text = _MD_UNDERSCORE_BOLD_RE.sub(r"\1", text)
     text = _MD_ITALIC_RE.sub(r"\1", text)
     text = _MD_UNDERSCORE_ITALIC_RE.sub(r"\1", text)
     text = _MD_STRIKE_RE.sub(r"\1", text)
+    # Speak file paths ("slash home slash user slash doc dot pdf") instead of deleting
+    # them; bare filenames with a known extension are also spoken as themselves.
+    text = _PATH_TOKEN_RE.sub(lambda m: " " + _path_to_spoken(m.group(0)) + " ", text)
+    text = _PATH_INTRO_RE.sub(" ", text)
     # Mark headings (do not just delete the marker): see _HEAD.
     text = _MD_HEADING_LINE_RE.sub(lambda m: m.group(1).rstrip() + _HEAD, text)
     text = _MD_BLOCKQUOTE_RE.sub("", text)
@@ -110,9 +147,12 @@ def normalize_symbols_for_tts(text: str) -> str:
     for unit, word in _DEGREE_UNITS:
         text = re.sub(r"°\s*" + unit + r"\b", "degrees " + word, text, flags=re.IGNORECASE)
     text = re.sub(r"(?<!\w)([-+]?\d+(?:\.\d+)?)\s*°", r"\1 degrees", text).replace("°", " degrees")
-    # Common weather/travel units.
+    # Common weather/travel units.  Case-sensitive: a capital M/K after a number is a
+    # magnitude suffix ("$1.5M", "5K rows"), not a metric unit — handled next.
     for pattern, word in _UNIT_WORDS:
-        text = re.sub(r"(?<=\d)\s*" + pattern + r"\b", " " + word, text, flags=re.IGNORECASE)
+        text = re.sub(r"(?<=\d)\s*" + pattern + r"\b", " " + word, text)
+    for pattern, word in _MAGNITUDE_SUFFIXES:
+        text = re.sub(r"(?<=\d)\s*" + pattern + r"\b", " " + word, text)
     # Numeric rates only ("5/month" -> "5 per month").  Requiring digit-then-letter
     # keeps "and/or", "N/A", "TCP/IP" and dates like "2026/06" intact.
     text = re.sub(r"(?<=\d)\s*/\s*(?=[A-Za-z])", " per ", text)
@@ -126,6 +166,8 @@ def normalize_symbols_for_tts(text: str) -> str:
     text = re.sub("[•◦▪▫]", " ", text.replace("&", " and "))  # bullet glyphs
     for symbol, word in (("→", " to "), ("⇒", " to "), ("≈", " about "), ("~", " about ")):
         text = text.replace(symbol, word)
+    for pattern, word in _SPOKEN_ABBREVIATIONS:
+        text = re.sub(pattern, word, text)
     return _EMOJI_RE.sub("", _VARIATION_SELECTOR_RE.sub("", text))
 
 
@@ -191,15 +233,61 @@ _THINK_BLOCK_OPEN_RE = re.compile(r"<think[\s>].*\Z", flags=re.DOTALL | re.IGNOR
 # header line plus indented ``•`` bullets) is a UI affordance, not speech.
 _VERIFIER_FOOTER_RE = re.compile(r"^\s*⚠️?\s*File-mutation verifier:.*(?:\n[ \t]+•.*)*", flags=re.MULTILINE)
 
+# ``run_turn.py`` may prepend reasoning for visual Discord display.  It is not part of the
+# answer and must not leak into voice playback, regardless of the configured display style.
+_DISPLAY_REASONING_FENCED_RE = re.compile(
+    r"\A[ \t]*(?:[-#>]+[ \t]*)?(?:💭[ \t]*)?\*{0,2}Reasoning:?\*{0,2}[ \t]*\n"
+    r"[ \t]*```[\s\S]*?```[ \t]*(?:\n|$)", flags=re.IGNORECASE)
+_DISPLAY_REASONING_SUBTEXT_RE = re.compile(
+    r"\A[ \t]*-#[ \t]*(?:💭[ \t]*)?\*{0,2}Reasoning:?\*{0,2}[ \t]*\n"
+    r"(?:^[ \t]*-#[ \t]?.*(?:\n|$))*", flags=re.MULTILINE | re.IGNORECASE)
+_DISPLAY_REASONING_BLOCKQUOTE_RE = re.compile(
+    r"\A[ \t]*>[ \t]*(?:💭[ \t]*)?\*{0,2}Reasoning:?\*{0,2}[ \t]*\n"
+    r"(?:^[ \t]*>.*(?:\n|$))*", flags=re.MULTILINE | re.IGNORECASE)
+_DISPLAY_REASONING_LABEL_RE = re.compile(
+    r"\A[ \t]*(?:[-#>]+[ \t]*)?(?:💭[ \t]*)?\*{0,2}Reasoning:?\*{0,2}[ \t]*",
+    flags=re.IGNORECASE)
+
 
 def strip_nonspoken_blocks(text: str) -> str:
-    """Remove ``<think>`` reasoning blocks and the file-mutation verifier footer."""
+    """Remove hidden/displayed reasoning and delivery-verifier metadata from speech."""
     if not text:
         return ""
-    for pattern in (_THINK_BLOCK_RE, _THINK_BLOCK_OPEN_RE, _VERIFIER_FOOTER_RE):
+    for pattern in (
+        _THINK_BLOCK_RE, _THINK_BLOCK_OPEN_RE, _VERIFIER_FOOTER_RE,
+        _DISPLAY_REASONING_FENCED_RE, _DISPLAY_REASONING_SUBTEXT_RE,
+        _DISPLAY_REASONING_BLOCKQUOTE_RE, _DISPLAY_REASONING_LABEL_RE,
+    ):
         text = pattern.sub(" ", text)
     return text
 
+
+def _path_to_spoken(path: str) -> str:
+    """Turn a file path into words a TTS engine reads naturally:
+    ``/home/user/doc.pdf`` -> ``slash home slash user slash doc dot pdf``."""
+    spoken = re.sub(r"\.(?=[A-Za-z0-9])", " dot ", path)  # extensions & dots in names
+    spoken = spoken.replace("/", " slash ").replace("\\", " slash ")
+    spoken = spoken.replace("_", " ").replace("-", " ")
+    return re.sub(r"\s+", " ", spoken).strip()
+
+
+# Paths are READ aloud ("slash home slash user slash doc dot pdf") when presenting a
+# file name or location, not deleted.  Keep ordinary rates (``5/month``) and prose
+# slashes intact; target absolute/relative paths and repo paths with a file extension.
+_PATH_TOKEN_RE = re.compile(
+    r"(?<!\w)(?:"
+    r"/(?:[A-Za-z0-9._~+@-]+/)+[A-Za-z0-9._~+@-]+"
+    r"|~/(?:[A-Za-z0-9._~+@-]+/)+[A-Za-z0-9._~+@-]+"
+    r"|(?:\.\.?/)(?:[A-Za-z0-9._~+@-]+/)*[A-Za-z0-9._~+@-]+"
+    r"|[A-Za-z]:[\\/](?:[^\\/\s,;:!?)]*[\\/])*[^\\/\s,;:!?)]*"
+    r"|(?:[A-Za-z0-9._-]+/)+[A-Za-z0-9._-]+\.(?:py|md|yaml|yml|json|toml|txt|wav|mp3|ogg|sh|js|ts|tsx|jsx)"
+    r")(?=$|[\s,;:!?])"
+)
+_PATH_INTRO_RE = re.compile(
+    r"\b(?:the\s+)?(?:file|response|output|change|code|script|path)\s+"
+    r"(?:is|was|lives|can be found)\s+(?:at|in)\s*(?=$|[,.;:!?])",
+    flags=re.IGNORECASE,
+)
 
 def flatten_newlines_for_payload(text: str) -> str:
     """Collapse newlines into sentence breaks for single-line TTS payloads: some OpenAI-compatible

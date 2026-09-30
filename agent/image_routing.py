@@ -4,9 +4,11 @@
 ``vision_analyze`` up-front and prepends the lossy description (right for
 non-vision models). :func:`decide_image_input_mode` picks once per turn from
 ``agent.image_input_mode`` (``auto`` | ``native`` | ``text``): in ``auto`` an
-explicit ``auxiliary.vision`` backend forces ``text`` even for vision-capable
-main models (``native`` is the absolute override); else ``supports_vision``
-(config override or catalog) decides. ``vision_analyze`` stays a tool regardless.
+explicit, distinct ``auxiliary.vision`` backend forces ``text`` even for
+vision-capable main models; an auxiliary route resolving to the active
+provider/model may use ``native`` directly (``native`` is the absolute override).
+Otherwise ``supports_vision`` (config override or catalog) decides.
+``vision_analyze`` stays a tool regardless.
 """
 
 from __future__ import annotations
@@ -259,16 +261,93 @@ def _coerce_mode(raw: Any) -> str:
     return mode if mode in _VALID_MODES else "auto"
 
 
-def _explicit_aux_vision_override(cfg: Optional[Dict[str, Any]]) -> bool:
-    """True when the user configured a specific ``auxiliary.vision`` backend — the
-    de-facto image route in ``auto`` mode even when the main model has native vision.
-    ``auto``/empty provider with no model and no base_url is not explicit."""
+def _explicit_aux_vision_override(
+    cfg: Optional[Dict[str, Any]],
+    provider: str = "",
+    model: str = "",
+    *,
+    requested_provider: str = "",
+) -> bool:
+    """True when ``auxiliary.vision`` is an explicit image route for this turn.
+
+    An explicit backend normally wins over native vision in ``auto`` mode.  The
+    exception is an explicit backend that resolves to the *same* provider/model
+    route as the active model: asking the active model to analyze the image is
+    then equivalent to viewing it directly, and avoids a needless second LLM
+    round-trip.  Endpoint identity is checked when both routes declare one so a
+    same-named model behind a different endpoint is never treated as identical.
+    ``auto``/empty provider with no model and no base_url is not explicit.
+    """
     vision = _dict_or_empty(_dict_or_empty(_dict_or_empty(cfg).get("auxiliary")).get("vision"))
-    return bool(vision) and not (
+    if not vision:
+        return False
+    if (
         _clean_str(vision.get("provider")).lower() in {"", "auto"}
         and not _clean_str(vision.get("model"))
         and not _clean_str(vision.get("base_url"))
-    )
+    ):
+        return False
+
+    if _same_vision_route(cfg, vision, provider, model, requested_provider=requested_provider):
+        return False
+    return True
+
+
+def _normalized_vision_provider(value: Any) -> str:
+    """Normalize provider aliases without making routing depend on import order."""
+    provider = _clean_str(value).lower()
+    try:
+        from agent.auxiliary_client import _normalize_aux_provider
+        return _clean_str(_normalize_aux_provider(provider)).lower()
+    except Exception:
+        if provider.startswith("custom:") and provider.split(":", 1)[1].strip():
+            provider = provider.split(":", 1)[1].strip()
+        return provider
+
+
+def _normalized_vision_model(value: Any) -> str:
+    return _clean_str(value).lower()
+
+
+def _same_vision_route(
+    cfg: Optional[Dict[str, Any]],
+    vision: Dict[str, Any],
+    provider: str,
+    model: str,
+    *,
+    requested_provider: str = "",
+) -> bool:
+    """Whether the configured vision route is the active inference route.
+
+    This is intentionally conservative: an omitted/auto auxiliary provider,
+    a missing configured model, or conflicting explicit endpoints returns False
+    and preserves the normal auxiliary-text route.
+    """
+    aux_provider = _clean_str(vision.get("provider"))
+    aux_model = _normalized_vision_model(vision.get("model"))
+    active_providers = {
+        _normalized_vision_provider(value)
+        for value in (provider, requested_provider)
+        if _clean_str(value)
+    }
+    if not aux_provider or aux_provider.lower() in {"", "auto"} or not aux_model:
+        return False
+    if not active_providers or _normalized_vision_provider(aux_provider) not in active_providers:
+        return False
+    if not any(_normalized_vision_model(value) == aux_model for value in (model,)):
+        return False
+
+    aux_base_url = _clean_str(vision.get("base_url"))
+    if aux_base_url:
+        # Only claim identity when the active route's endpoint is also known.
+        # A missing active base_url is not enough to prove two custom routes are
+        # the same server, so fail closed to the aux route.
+        main_base_url = _runtime_main("base_url")
+        if not main_base_url and isinstance(cfg, dict):
+            main_base_url = _clean_str(_dict_or_empty(cfg.get("model")).get("base_url"))
+        if not main_base_url or aux_base_url.rstrip("/") != main_base_url.rstrip("/"):
+            return False
+    return True
 
 
 def _probe_managed_runtime(provider: str, model: str, cfg: Optional[Dict[str, Any]]) -> Optional[bool]:
@@ -380,7 +459,9 @@ def decide_image_input_mode(
     mode_cfg = _coerce_mode(_dict_or_empty(_dict_or_empty(cfg).get("agent")).get("image_input_mode"))
     if mode_cfg != "auto":
         return mode_cfg
-    if _explicit_aux_vision_override(cfg):  # auto: an explicit auxiliary.vision backend wins
+    if _explicit_aux_vision_override(
+        cfg, provider, model, requested_provider=requested_provider
+    ):  # auto: an explicit, distinct auxiliary.vision backend wins
         return "text"
     # Keep the three-argument call contract for callers/tests that replace the lookup hook.
     extra = {"requested_provider": requested_provider} if requested_provider else {}

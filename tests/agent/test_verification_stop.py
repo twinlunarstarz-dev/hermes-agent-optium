@@ -166,3 +166,30 @@ def test_mixed_doc_and_code_edit_still_nudges(tmp_path, monkeypatch):
     # The doc path is filtered out of the reported set; the code path remains.
     assert code in nudge
     assert doc not in nudge
+
+
+def test_is_non_code_path_classification():
+    from agent.verification_stop import _is_non_code_path
+
+    assert _is_non_code_path("docs/SKILL.md") is True
+    assert _is_non_code_path("README") is False  # README has no extension and isn't in the prose-filename set
+    assert _is_non_code_path("LICENSE") is True
+    assert _is_non_code_path("src/app.ts") is False
+    assert _is_non_code_path("config.yaml") is False
+    assert _is_non_code_path("run_agent.py") is False
+
+
+def test_cron_final_response_is_not_reopened_by_verify_on_stop(monkeypatch):
+    from types import SimpleNamespace
+
+    from agent.turn_stop_gates import _verify_on_stop_nudge
+
+    monkeypatch.setenv("HERMES_VERIFY_ON_STOP", "1")
+    agent = SimpleNamespace(
+        platform="cron",
+        session_id="cron_job_123",
+        _turn_file_mutation_paths={"/tmp/trading-state.json"},
+        _verification_stop_nudges=0,
+    )
+
+    assert _verify_on_stop_nudge(agent) is None

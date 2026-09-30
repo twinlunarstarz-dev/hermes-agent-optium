@@ -1106,8 +1106,12 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         # Voice-reply mode ("off"|"voice_only"|"all") per linked text-channel id (set by run.py) so
         # the inactivity timer keeps the bot in channel for /voice off, unlike /voice leave.
         self._voice_mode_getter: Optional[Callable] = None  # set by run.py
-        # Continuous voice mixer per guild (ambient bed + ducked speech) so acks/TTS/thinking overlap.
+        # Continuous voice mixer per guild (ambient bed + ducked speech).
         self._voice_mixers: Dict[int, Any] = {}  # guild_id -> VoiceMixer
+        # FIFO playback per active guild. Synthesis may overlap, but clips play in arrival order.
+        self._voice_speech_queues: Dict[int, "asyncio.Queue[str]"] = {}
+        self._voice_speech_tasks: Dict[int, asyncio.Task] = {}
+        self._voice_speech_queue_limit = 32
         self._ambient_pcm_cache: Optional[bytes] = None  # decoded ambient bed
         self._voice_fx_cfg: Dict[str, Any] = self._load_voice_fx_config()
         # Threads the bot participated in (no @mention needed there); persisted across restarts.
@@ -3046,6 +3050,146 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             kept.append(notice)
         return kept
 
+    async def _maybe_speak_interim_in_voice(self, chat_id: str, content: str, metadata: dict) -> None:
+        """Speak interim agent messages in voice channel when appropriate.
+
+        This runs fire-and-forget so it never blocks the text send path.
+        Only speaks when:
+        - User is in a voice channel (guild_id resolved from chat)
+        - Voice mode is "all" or ("voice_only" + voice-origin turn)
+        - Content is interim (metadata["_interim_send"] is True) or a non-final user-facing send
+        - Content passes filters (no "Error:", not empty, not markdown/code-only)
+        """
+        try:
+            # Resolve guild id from the channel / thread parent. discord.py channel
+            # objects expose ``guild.id`` (there is no ``guild_id`` attribute on
+            # TextChannel/Thread in discord.py 2.x), so read both shapes.
+            channel = await self._resolve_channel(chat_id)
+            if channel is None:
+                logger.info("[Discord] interim-speak skip: channel %s unresolved", chat_id)
+                return
+            guild_obj = getattr(channel, "guild", None)
+            guild_id = getattr(guild_obj, "id", None) or getattr(channel, "guild_id", None)
+            if guild_id is None:
+                logger.info("[Discord] interim-speak skip: no guild for chat %s", chat_id)
+                return
+            if not self.is_in_voice_channel(guild_id):
+                logger.info(
+                    "[Discord] interim-speak skip: bot not in voice channel (guild=%s)", guild_id)
+                return
+
+            # Voice mode gate
+            mode_getter = getattr(self, "_voice_mode_getter", None)
+            if mode_getter is None:
+                logger.info("[Discord] interim-speak skip: no voice mode getter wired")
+                return
+            voice_mode = mode_getter(chat_id)
+            if voice_mode == "off":
+                logger.info("[Discord] interim-speak skip: voice mode off (chat=%s)", chat_id)
+                return
+            # "all" mode speaks everything; "voice_only" only speaks voice-origin turns
+            is_voice_origin = bool(metadata.get("_voice_origin", False))
+            if voice_mode == "voice_only" and not is_voice_origin:
+                logger.info(
+                    "[Discord] interim-speak skip: voice_only mode, non-voice origin (chat=%s)", chat_id)
+                return
+
+            # Content filters
+            # Skip finals (run_voice speaks them separately); only speak interims
+            if not metadata.get("_interim_send", False):
+                logger.info("[Discord] interim-speak skip: not an interim send (chat=%s)", chat_id)
+                return
+
+            # Strip via prepare_spoken_text and skip if result < 10 chars
+            from tools.tts_text_normalize import prepare_spoken_text
+            spoken = prepare_spoken_text(content, max_chars=None)
+            if len(spoken.strip()) < 10:
+                logger.info(
+                    "[Discord] interim-speak skip: spoken text too short after normalize (chat=%s)", chat_id)
+                return
+
+            # Skip if contains "Error:"
+            if "Error:" in spoken:
+                logger.info("[Discord] interim-speak skip: error text (chat=%s)", chat_id)
+                return
+
+            # Split normalized text into sentences, cap at ~400 chars per chunk so each TTS call is bounded
+            import re as re_mod
+            sentences = [s.strip() for s in re_mod.split(r"(?<=[.!?])\s+", spoken) if s.strip()]
+            chunks: list[str] = []
+            current = ""
+            for sentence in sentences:
+                trial = (current + " " + sentence).strip() if current else sentence
+                if len(trial) <= 400:
+                    current = trial
+                else:
+                    if current:
+                        chunks.append(current)
+                    current = sentence
+            if current:
+                chunks.append(current)
+
+            if not chunks:
+                return
+
+            # Reserve before synthesis so FIFO order follows visible-message arrival, not TTS
+            # completion order. All sentence clips for one assistant message share this ticket.
+            guild_id_int = int(guild_id)
+            ticket = self.reserve_voice_speech(guild_id_int)
+            if ticket is None:
+                logger.warning(
+                    "[Discord] interim-speak: speech queue overflow, dropping interim (guild=%d, chat=%s)",
+                    guild_id_int, chat_id)
+                return
+            logger.info(
+                "[Discord] interim-speak: reserved ticket=%s, synthesizing %d chunk(s) (guild=%d, chat=%s)",
+                ticket, len(chunks), guild_id_int, chat_id)
+
+            # Fire-and-forget: schedule TTS so send() never blocks on synthesis or playback.
+            import asyncio as _asyncio
+            from tools.tts_tool import text_to_speech_tool
+
+            async def _speak_sentences():
+                paths: list[str] = []
+                handed_off = False
+                import uuid as _uuid_mod
+                try:
+                    for chunk in chunks:
+                        tmp_path = os.path.join(
+                            tempfile.gettempdir(), "hermes_voice", f"interim_{_uuid_mod.uuid4().hex[:12]}.mp3")
+                        actual_path = tmp_path
+                        try:
+                            result = await _asyncio.to_thread(
+                                text_to_speech_tool, text=chunk, output_path=tmp_path
+                            )
+                            data = json.loads(result) if isinstance(result, str) else {}
+                            actual_path = str(data.get("file_path") or tmp_path)
+                            if data.get("success") and os.path.isfile(actual_path):
+                                paths.append(actual_path)
+                            else:
+                                actual_path = None
+                        except Exception as e:
+                            actual_path = None
+                            logger.debug("_maybe_speak_interim_in_voice sentence failed: %s", e)
+                        finally:
+                            if actual_path is None:
+                                with suppress(OSError):
+                                    os.unlink(tmp_path)
+
+                    if paths:
+                        handed_off = self.enqueue_voice_speech_batch(guild_id_int, paths, ticket=ticket)
+                    if not handed_off:
+                        self.cancel_voice_speech_reservation(guild_id_int, ticket)
+                finally:
+                    if not handed_off:
+                        for path in paths:
+                            with suppress(OSError):
+                                os.unlink(path)
+
+            _asyncio.create_task(_speak_sentences())
+        except Exception as e:
+            logger.debug("_maybe_speak_interim_in_voice unexpected error: %s", e, exc_info=True)
+
     async def send(
         self,
         chat_id: str,
@@ -3116,6 +3260,9 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                     await self._nonconversational_messages.mark_many(message_ids)
                 elif not _looks_like_nonconversational_history_message(content):
                     self._last_self_message_id[_target_id] = message_ids[-1]
+                # Speak interim messages in voice channel (fire-and-forget, won't block send)
+                if metadata and metadata.get("_interim_send"):
+                    await self._maybe_speak_interim_in_voice(chat_id, content, metadata)
             # Connection-shaped failure (WS drop / closed session): use the ledger's runtime-retryable
             # marker so the reconnect sweep can replay this final response instead of stranding it until a
             # process restart (#95382 silent partial loss).
@@ -3380,11 +3527,50 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         )
 
     async def play_tts(self, chat_id: str, audio_path: str, **kwargs) -> SendResult:
-        """Play auto-TTS audio: in the guild's VC if joined, else as a file attachment."""
+        """Play auto-TTS audio: in the guild's VC if joined, else as a file attachment.
+
+        Unified pipeline: VC playback goes through the per-guild FIFO speech queue
+        (reserve ticket → enqueue batch) so finals interleave strictly in arrival
+        order with interim speech, instead of jumping the queue via direct playback.
+        Queue overflow / enqueue failure falls back to direct playback so audio is
+        never silently dropped."""
         for gid, text_ch_id in self._voice_text_channels.items():
             if str(text_ch_id) == str(chat_id) and self.is_in_voice_channel(gid):
-                logger.info("[%s] Playing TTS in voice channel (guild=%d)", self.name, gid)
-                success = await self.play_in_voice_channel(gid, audio_path)
+                gid_int = int(gid)
+                _reserve = getattr(self, "reserve_voice_speech", None)
+                _queues_ready = isinstance(getattr(self, "_voice_speech_queues", None), dict)
+                ticket = _reserve(gid_int) if (callable(_reserve) and _queues_ready) else None
+                if ticket is not None:
+                    # Own the queued copy: callers (base.py auto-TTS finally / run_voice cleanup)
+                    # delete the original temp file as soon as play_tts returns, but the FIFO
+                    # queue may sit behind interim clips for minutes. Copy to a queue-owned
+                    # temp name; the mixer/drainer owns and deletes the copy after playback.
+                    import shutil as _shutil
+                    import uuid as _uuid
+                    queued_path = os.path.join(
+                        tempfile.gettempdir(), "hermes_voice",
+                        f"queued_final_{_uuid.uuid4().hex[:12]}.mp3")
+                    try:
+                        os.makedirs(os.path.dirname(queued_path), exist_ok=True)
+                        _shutil.copyfile(audio_path, queued_path)
+                    except OSError as _copy_err:
+                        logger.warning(
+                            "[%s] Final TTS queue copy failed (%s); falling back to direct playback",
+                            self.name, _copy_err)
+                        queued_path = None
+                    if queued_path and os.path.isfile(queued_path):
+                        if self.enqueue_voice_speech_batch(gid_int, [queued_path], ticket=ticket):
+                            logger.info(
+                                "[%s] Queued final TTS in speech queue (guild=%d, ticket=%s, file=%s)",
+                                self.name, gid_int, ticket, os.path.basename(queued_path))
+                            return SendResult(success=True)
+                        self.cancel_voice_speech_reservation(gid_int, ticket)
+                        with suppress(OSError):
+                            os.unlink(queued_path)
+                    else:
+                        self.cancel_voice_speech_reservation(gid_int, ticket)
+                logger.info("[%s] Playing TTS in voice channel (guild=%d)", self.name, gid_int)
+                success = await self.play_in_voice_channel(gid_int, audio_path)
                 return SendResult(success=success)
         return await self.send_voice(chat_id=chat_id, audio_path=audio_path, **kwargs)
 
@@ -3526,6 +3712,171 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         self._voice_mixers[guild_id] = mixer
         logger.info("Voice mixer installed (guild=%d, ambient=%s)", guild_id, bool(ambient))
 
+    def _voice_speech_state(self, guild_id: int) -> dict:
+        """Get or create per-guild reservation state; each guild owns one playback worker."""
+        states = getattr(self, "_voice_speech_states", None)
+        if states is None:
+            states = {}
+            self._voice_speech_states = states
+        guild_id = int(guild_id)
+        state = states.get(guild_id)
+        if state is None:
+            queues = getattr(self, "_voice_speech_queues", None)
+            if queues is None:
+                queues = {}
+                self._voice_speech_queues = queues
+            queue = queues.get(guild_id)
+            if queue is None:
+                queue = asyncio.Queue(maxsize=int(getattr(self, "_voice_speech_queue_limit", 32)))
+                queues[guild_id] = queue
+            state = {
+                "queue": queue,
+                "slots": {},
+                "next_ticket": 0,
+                "next_to_play": 0,
+                "pending": queue.qsize(),
+                "closed": False,
+            }
+            states[guild_id] = state
+        return state
+
+    def reserve_voice_speech(self, guild_id: int) -> Optional[int]:
+        """Reserve one message's position before synthesis; reject-new bounds outstanding work."""
+        state = self._voice_speech_state(guild_id)
+        limit = int(getattr(self, "_voice_speech_queue_limit", 32))
+        if state["closed"] or state["pending"] >= limit:
+            logger.warning("Discord voice speech queue full for guild=%d; dropping newest message", guild_id)
+            return None
+        ticket = state["next_ticket"]
+        state["next_ticket"] += 1
+        state["pending"] += 1
+        state["slots"][ticket] = {"ready": asyncio.Event(), "paths": None, "pending": True}
+        return ticket
+
+    def _publish_voice_speech(self, guild_id: int, ticket: int, paths: tuple) -> bool:
+        state = self._voice_speech_state(guild_id)
+        slot = state["slots"].get(ticket)
+        if state["closed"] or slot is None or slot["paths"] is not None:
+            return False
+        slot["paths"] = paths
+        slot["ready"].set()
+        task = getattr(self, "_voice_speech_tasks", {}).get(int(guild_id))
+        if task is None or task.done():
+            task = asyncio.create_task(self._drain_voice_speech_queue(int(guild_id)))
+            self._voice_speech_tasks[int(guild_id)] = task
+        return True
+
+    def enqueue_voice_speech(
+        self, guild_id: int, audio_path: str, *, ticket: Optional[int] = None
+    ) -> bool:
+        """Publish one synthesized clip against its reserved message-arrival ticket."""
+        if ticket is None:
+            ticket = self.reserve_voice_speech(guild_id)
+        if ticket is None:
+            return False
+        return self._publish_voice_speech(guild_id, ticket, (str(audio_path),))
+
+    def enqueue_voice_speech_batch(
+        self, guild_id: int, audio_paths: List[str], *, ticket: Optional[int] = None
+    ) -> bool:
+        """Publish all parts of one assistant message at one reserved queue position."""
+        if ticket is None:
+            ticket = self.reserve_voice_speech(guild_id)
+        if ticket is None:
+            return False
+        paths = tuple(str(path) for path in audio_paths if path)
+        if not paths:
+            self.cancel_voice_speech_reservation(guild_id, ticket)
+            return False
+        return self._publish_voice_speech(guild_id, ticket, paths)
+
+    def cancel_voice_speech_reservation(self, guild_id: int, ticket: int) -> None:
+        """Release a reservation whose synthesis failed before audio was published."""
+        state = self._voice_speech_state(guild_id)
+        slot = state["slots"].get(ticket)
+        if slot is None:
+            return
+        if slot["pending"]:
+            slot["pending"] = False
+            state["pending"] = max(0, state["pending"] - 1)
+        slot["paths"] = ()
+        slot["ready"].set()
+        task = getattr(self, "_voice_speech_tasks", {}).get(int(guild_id))
+        if task is not None and not task.done():
+            # A failed earlier reservation still needs the worker to advance to its successor.
+            state["slots"].setdefault(ticket, slot)["ready"].set()
+
+    async def _drain_voice_speech_queue(self, guild_id: int) -> None:
+        """Play reserved message groups in arrival order with per-part failure isolation."""
+        state = self._voice_speech_state(guild_id)
+        queue = state["queue"]
+        current_paths: tuple = ()
+        queued = False
+        try:
+            while True:
+                if state["closed"]:
+                    return
+                ticket = state["next_to_play"]
+                slot = state["slots"].get(ticket)
+                if slot is None:
+                    # A worker is started only after a publish; no future reservation can
+                    # exist without a corresponding slot.
+                    return
+                await slot["ready"].wait()
+                if state["closed"]:
+                    return
+                current_paths = tuple(slot["paths"] or ())
+                state["slots"].pop(ticket, None)
+                state["next_to_play"] = ticket + 1
+                if slot["pending"]:
+                    slot["pending"] = False
+                    state["pending"] = max(0, state["pending"] - 1)
+                await queue.put(ticket)
+                queued = True
+                for audio_path in current_paths:
+                    try:
+                        await self.play_in_voice_channel(guild_id, audio_path)
+                    except Exception:
+                        logger.warning(
+                            "Discord voice speech item failed (guild=%d): %s",
+                            guild_id, audio_path, exc_info=True,
+                        )
+                    finally:
+                        with suppress(OSError):
+                            os.unlink(audio_path)
+                current_paths = ()
+                queue.task_done()
+                queued = False
+        except asyncio.CancelledError:
+            for audio_path in current_paths:
+                with suppress(OSError):
+                    os.unlink(audio_path)
+            if queued:
+                with suppress(Exception):
+                    queue.task_done()
+            raise
+
+    async def _cancel_voice_speech_queue(self, guild_id: int) -> None:
+        """Cancel playback and unlink every queued clip for a disconnect/reconnect boundary."""
+        guild_id = int(guild_id)
+        state = getattr(self, "_voice_speech_states", {}).get(guild_id)
+        if state is not None:
+            state["closed"] = True
+        task = getattr(self, "_voice_speech_tasks", {}).pop(guild_id, None)
+        if task and not task.done():
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+        if state is not None:
+            for slot in state["slots"].values():
+                for path in slot["paths"] or ():
+                    with suppress(OSError):
+                        os.unlink(path)
+            state["slots"].clear()
+            state["pending"] = 0
+        getattr(self, "_voice_speech_states", {}).pop(guild_id, None)
+        getattr(self, "_voice_speech_queues", {}).pop(guild_id, None)
+
     def _lead_silence_bytes(self) -> bytes:
         """Silence prepended to speech clips: Discord's voice socket warm-up otherwise clips
         the first ~100-200ms. Returns b"" when ``lead_silence_ms`` <= 0 (opt-out)."""
@@ -3601,6 +3952,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 if existing.channel.id == channel.id:
                     self._reset_voice_timeout(guild_id)
                     return True
+                await self._cancel_voice_speech_queue(guild_id)
                 await existing.move_to(channel)
                 self._reset_voice_timeout(guild_id)
                 return True
@@ -3631,6 +3983,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
     async def leave_voice_channel(self, guild_id: int) -> None:
         """Disconnect from the voice channel in a guild."""
         async with self._voice_locks.setdefault(guild_id, asyncio.Lock()):
+            await self._cancel_voice_speech_queue(guild_id)
             receiver = self._voice_receivers.pop(guild_id, None)
             pending_inputs = []
             if receiver:

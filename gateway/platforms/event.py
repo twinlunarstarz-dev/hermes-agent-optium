@@ -84,6 +84,12 @@ class MessageEvent:
     internal: bool = False
     # Free-form per-event metadata (e.g. ``whatsapp_from_owner=True``); plugins must ``.get()``.
     metadata: Dict[str, Any] = field(default_factory=dict)
+    # Content classification flags for TTS/voice routing. Adapters and lifecycle hooks set these so
+    # downstream consumers (branch sessions, voice mixers) can decide what to speak or store.
+    is_tool_call: bool = False
+    is_reasoning: bool = False
+    is_user_facing: bool = False
+    is_voice_reply: bool = False
     timestamp: datetime = field(default_factory=datetime.now)
     # May this event resolve gateway commands / control prompts? Proactive plugin events set False
     # so untrusted payload text stays conversational. New fields append after it (positional compat).
