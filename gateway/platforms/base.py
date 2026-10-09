@@ -4148,6 +4148,86 @@ class BasePlatformAdapter(ABC):
             logger.warning("[%s] Auto-TTS failed: %s", self.name, tts_err)
         return paths, requested_path
 
+    # ------------------------------------------------------------------ Final-reply TTS synthesis queue
+    # Synthesis is deliberately kept OFF the turn's critical path. Measured on this box
+    # (qwen3-tts, Qwen3-TTS Base): 32-140s of wall time to render a single final reply, plus
+    # ~43-49s for the first model load. ``_synthesize_auto_tts`` runs the model via
+    # ``asyncio.to_thread``, so it does not block the event loop -- but awaiting it INLINE in
+    # ``_process_message_background`` delayed the text send by the entire synthesis, which is
+    # exactly the "TTS holds up the agent" symptom. Jobs go on this queue instead; a single
+    # worker synthesizes and then hands the finished file to the platform's existing playback
+    # queue via ``play_tts`` (which is itself already non-blocking).
+
+    def _tts_synth_queue(self) -> "asyncio.Queue":
+        """Lazily create the final-reply TTS synthesis queue."""
+        q = getattr(self, "_tts_synth_queue_obj", None)
+        if q is None:
+            q = asyncio.Queue(maxsize=int(getattr(self, "_tts_synth_queue_limit", 8)))
+            self._tts_synth_queue_obj = q
+        return q
+
+    def _ensure_tts_synth_worker(self) -> None:
+        """Start the drain task if it is not already running."""
+        task = getattr(self, "_tts_synth_task", None)
+        if task is not None and not task.done():
+            return
+        try:
+            self._tts_synth_task = asyncio.create_task(self._drain_tts_synth_queue())
+        except RuntimeError:
+            # No running loop (sync/CLI context) -- caller falls back to the inline path.
+            self._tts_synth_task = None
+
+    def _enqueue_auto_tts(self, chat_id: str, text_content: str, metadata: Dict[str, Any]) -> bool:
+        """Queue final-reply TTS for background synthesis. False when not queued (caller
+        falls back to inline synthesis so audio is never silently dropped)."""
+        try:
+            self._tts_synth_queue().put_nowait({
+                "chat_id": chat_id,
+                "text": text_content,
+                "metadata": dict(metadata or {}),
+            })
+        except asyncio.QueueFull:
+            logger.warning(
+                "[%s] auto-TTS synthesis queue full; falling back to inline synthesis", self.name)
+            return False
+        self._ensure_tts_synth_worker()
+        return True
+
+    async def _drain_tts_synth_queue(self) -> None:
+        """Synthesize queued final replies one at a time, then hand each to playback.
+
+        Serial by design: the qwen3-tts bridge takes an exclusive worker lock and holds the
+        model in a single process, so concurrent jobs would only contend on it. Playback stays
+        asynchronous -- ``play_tts`` enqueues into the per-chat speech queue and returns.
+        """
+        queue = self._tts_synth_queue()
+        while True:
+            try:
+                job = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            try:
+                paths, requested = await self._synthesize_auto_tts(job["text"])
+                try:
+                    for path in paths:
+                        try:
+                            await self.play_tts(
+                                chat_id=job["chat_id"], audio_path=path, metadata=job["metadata"],
+                            )
+                        finally:
+                            # Ownership transferred to this worker: the turn no longer deletes it.
+                            with contextlib.suppress(OSError):
+                                os.remove(path)
+                finally:
+                    if not paths and requested is not None:
+                        with contextlib.suppress(OSError):
+                            os.remove(requested)
+            except Exception:
+                logger.warning(
+                    "[%s] Background auto-TTS synthesis failed", self.name, exc_info=True)
+            finally:
+                queue.task_done()
+
     def _wants_auto_tts(self, event: MessageEvent, session_key: str, interrupt_event: asyncio.Event,
                         text_content: str, media_files: list) -> bool:
         """Auto-TTS on voice input (voice-first), gated by /voice or voice.auto_tts;
@@ -4528,10 +4608,19 @@ class BasePlatformAdapter(ABC):
                 # Final content gets notify=True; typing metadata stays unmarked (thread-strict).
                 _final_thread_metadata = _mark_notify_metadata(_thread_metadata)
                 _tts_paths, _tts_requested_path = [], None
+                # TTS is synthesized OFF the turn's critical path. Handing the job to the
+                # background synthesis queue returns immediately, so the text send below is
+                # never gated on a 30-140s model render. If the queue cannot accept the job
+                # (full, or no running loop) fall back to the original inline synthesis so
+                # audio is never silently dropped.
+                _tts_deferred = False
                 if self._wants_auto_tts(
                         event, session_key, interrupt_event, text_content, media_files):
-                    _tts_paths, _tts_requested_path = await self._synthesize_auto_tts(text_content)
-                # TTS plays before text; generated files are removed afterwards.
+                    _tts_deferred = self._enqueue_auto_tts(
+                        event.source.chat_id, text_content, _final_thread_metadata)
+                    if not _tts_deferred:
+                        _tts_paths, _tts_requested_path = await self._synthesize_auto_tts(text_content)
+                # Deferred jobs own their files; inline ones are removed after playback below.
                 _tts_caption_delivered = False
                 for _tts_index, _tts_path in enumerate(_tts_paths):
                     try:

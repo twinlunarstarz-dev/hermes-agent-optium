@@ -58,6 +58,42 @@ async def _persist_model_switch_to_config(result, config_path) -> None:
     await asyncio.to_thread(persist_model_selection, result, config_path)
 
 
+def _persist_provider_routing_sync(model_id: str, routing: Optional[dict], config_path) -> bool:
+    """Set or clear the per-model OpenRouter routing overlay for *model_id* (off-loop caller).
+
+    ``routing`` is a validated ``provider:`` object fragment (``order`` / ``allow_fallbacks`` /
+    ``quantizations``); ``None`` clears any existing per-model pins (Auto). Targeted key write via
+    :func:`atomic_roundtrip_yaml_update` — flat ``provider_routing.*`` siblings survive. Returns
+    True when the file was written."""
+    from pathlib import Path
+    from hermes_cli.config import get_config_path, read_user_config_raw
+    from utils import atomic_roundtrip_yaml_update
+
+    path = Path(config_path) if config_path else get_config_path()
+    cfg = read_user_config_raw(path)
+    pr = dict(cfg.get("provider_routing") or {})
+    models = dict(pr.get("models") or {})
+    if routing:
+        entry = dict(models.get(model_id) or {})
+        entry.update(routing)
+        models[model_id] = entry
+    else:
+        models.pop(model_id, None)
+    pr.pop("models", None)
+    if models:
+        pr["models"] = models
+    if pr:
+        atomic_roundtrip_yaml_update(path, "provider_routing", pr)
+    else:
+        atomic_roundtrip_yaml_update(path, "provider_routing", None)
+    try:  # owner-only: config files contain API keys
+        import os
+        os.chmod(path, 0o600)
+    except (OSError, NotImplementedError):
+        pass
+    return True
+
+
 @dataclasses.dataclass
 class _ModelSwitchContext:
     """Everything a /model switch needs beyond the target: current route + persistence policy."""
@@ -459,19 +495,28 @@ class GatewayModelCommandsMixin:
         )
         adapter = self._delivery_adapter_for(ctx.source)
         if adapter is not None and getattr(type(adapter), "send_model_picker", None) is not None:
-            async def _picker_switch(model_id: str, provider_slug: str) -> str:
+            async def _picker_switch(model_id: str, provider_slug: str, provider_routing: Optional[dict] = None) -> str:
                 # The picker callback binds the raw event source (pre-normalization).
                 result, error = await self._perform_model_switch(ctx, model_id, provider_slug, event.source)
                 if error is not None:
                     return error
-                return await self._commit_model_switch(result, ctx, source=event.source, picker=True)
+                reply = await self._commit_model_switch(result, ctx, source=event.source, picker=True)
+                if provider_slug == "openrouter":
+                    # Per-model routing overlay: a pin dict or None (clear → Auto). Never fails
+                    # the switch — a config write hiccup only costs the pin.
+                    try:
+                        await asyncio.to_thread(_persist_provider_routing_sync, model_id, provider_routing, ctx.config_path)
+                    except Exception as exc:
+                        logger.debug("provider routing persist failed", exc_info=True)
+                        reply = reply + "\n" + t("gateway.model.routing_persist_failed", error=str(exc))
+                return reply
 
-            async def _on_model_selected(_chat_id: str, model_id: str, provider_slug: str) -> str:
+            async def _on_model_selected(_chat_id: str, model_id: str, provider_slug: str, provider_routing: Optional[dict] = None) -> str:
                 if profile_home is None:
-                    return await _picker_switch(model_id, provider_slug)
+                    return await _picker_switch(model_id, provider_slug, provider_routing)
                 from gateway.run import _profile_runtime_scope
                 with _profile_runtime_scope(profile_home):
-                    return await _picker_switch(model_id, provider_slug)
+                    return await _picker_switch(model_id, provider_slug, provider_routing)
 
             if await self._send_model_picker(event, ctx.source, adapter, ctx.session_key, listing_kwargs, _on_model_selected):
                 return None  # Picker sent — adapter handles the response

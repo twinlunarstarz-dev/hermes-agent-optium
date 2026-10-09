@@ -280,6 +280,13 @@ class CLIInitMixin:
         self._providers_order = pr.get("order")
         self._provider_require_params = pr.get("require_parameters", False)
         self._provider_data_collection = pr.get("data_collection")
+        # Explicit OpenRouter routing extras: allow_fallbacks only matters when False (strict
+        # pin — default True is the wire default), quantizations pins endpoint quantization(s).
+        _af = pr.get("allow_fallbacks")
+        self._provider_allow_fallbacks = bool(_af) if _af is not None else None
+        _quant = pr.get("quantizations")
+        self._provider_quantizations = (
+            [str(q).strip() for q in _quant if str(q).strip()] if isinstance(_quant, list) else None)
 
         # OpenRouter Pareto Code router coding-score floor; out-of-range = unset.
         _raw_score = (CLI_CONFIG.get("openrouter", {}) or {}).get("min_coding_score")

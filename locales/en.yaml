@@ -75,6 +75,7 @@ gateway:
     err_stale_override: "saved to config.yaml, but the stale session override was not cleared ({error})"
     next_turn_only: "    (next turn only — restores after one response)"
     switch_cancelled: "🟡 Model switch cancelled. Current model unchanged ({model})."
+    routing_persist_failed: "⚠️ Model switched, but saving the upstream routing pin failed ({error}) — the model routes Auto until re-pinned."
     guard_confirm: "⚠️ **{title}**\n\n{message}\n\n_Text fallback: reply `{prefix}approve` to switch or `{prefix}cancel` to keep the current model._"
   agents:
     header: "🤖 **Active Agents & Tasks**"
@@ -1092,6 +1093,14 @@ platform:
       choice_placeholder: "Choose an option..."
       choice_error: "Error applying selection: {error}"
       choice_expired: "⏱ Selection expired — no change made."
+      routing_placeholder: "Choose upstream routing..."
+      routing_menu_placeholder: "Select a provider…"
+      routing_select: "Model: **{model}**\nSelect upstream provider routing (saved per-model):"
+      routing_auto: "Auto (default routing)"
+      routing_cheapest: "Cheapest {quant} — {provider}"
+      routing_fastest: "Fastest — {provider}"
+      routing_strict: "{provider} (strict)"
+      routing_price: "${price}/M tok"
     # Native slash commands: description / parameter description / choice name ≤ 100 chars (baked
     # into Discord at sync time; the sync fingerprint includes the language). Names stay identifiers.
     command:

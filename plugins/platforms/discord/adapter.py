@@ -14,6 +14,7 @@ import datetime as dt
 import hashlib
 import inspect
 import json
+import urllib.request
 import logging
 import math
 import os
@@ -208,6 +209,8 @@ _DISCORD_SELECT_PLACEHOLDER_LIMIT = 150
 # Discord caps a single select menu at 25 options; a View holds at most 5 rows.
 _DISCORD_SELECT_MAX_OPTIONS = 25
 _DISCORD_SELECT_MAX_ROWS = 5
+# Routing-select placeholder row: re-renders the step (no routing change).
+_ROUTING_MENU_PLACEHOLDER = "__select__"
 # Model-select capacity: keep 2 rows for Back/Cancel, fill the rest with selects.
 _DISCORD_MODEL_SELECT_CAPACITY = (_DISCORD_SELECT_MAX_ROWS - 2) * _DISCORD_SELECT_MAX_OPTIONS
 _DISCORD_BUTTON_LABEL_LIMIT = 80
@@ -6906,8 +6909,9 @@ def _define_discord_view_classes() -> None:
             await self._respond(interaction, "n", discord.Color.red(), "platform.discord.prompt.negate")
 
     class ModelPickerView(_HermesView):
-        """Two-step select-menu model picker: provider dropdown → model dropdown,
-        editing the original message in place. Times out after 2 minutes."""
+        """Three-step select-menu model picker: provider dropdown → model dropdown →
+        (OpenRouter only) upstream provider-routing dropdown, editing the original
+        message in place. Times out after 2 minutes."""
 
         def __init__(
             self, providers: list, current_model: str, current_provider: str, session_key: str,
@@ -6921,7 +6925,184 @@ def _define_discord_view_classes() -> None:
             self.on_model_selected = on_model_selected
             self._selected_provider: str = ""
             self._pending_expensive_model: str = ""
+            self._pending_routing_model: str = ""
+            self._routing_choices: Dict[str, Optional[dict]] = {}
             self._build_provider_select()
+
+        # OpenRouter endpoint quantization -> picker label ("Q4"/"Q8"/...).
+        _QUANT_LABELS = {
+            "int4": "Q4", "int8": "Q8", "fp4": "FP4", "fp6": "FP6",
+            "fp8": "FP8", "bf16": "BF16", "fp16": "FP16", "none": "Full",
+        }
+
+        @staticmethod
+        def _endpoint_provider_slug(endpoint: dict) -> str:
+            """OpenRouter routing slug for an endpoint record (``tag`` is ``<slug>/<quant>``)."""
+            tag = str(endpoint.get("tag") or "")
+            slug = tag.split("/", 1)[0].strip()
+            if slug:
+                return slug
+            return str(endpoint.get("provider_name") or "").strip().lower().replace(" ", "-")
+
+        @staticmethod
+        def _endpoint_price_per_m(endpoint: dict) -> Optional[float]:
+            """Blended (prompt + completion) price in USD per million tokens, or None."""
+            pricing = endpoint.get("pricing") or {}
+            try:
+                prompt = float(pricing.get("prompt") or 0)
+                completion = float(pricing.get("completion") or 0)
+            except (TypeError, ValueError):
+                return None
+            if prompt < 0 or completion < 0:
+                return None
+            return (prompt + completion) * 1e6
+
+        @staticmethod
+        def _openrouter_endpoints_sync(model_id: str) -> list:
+            """Live upstream endpoints for an OpenRouter model (public API, no key needed)."""
+            url = f"https://openrouter.ai/api/v1/models/{model_id}/endpoints"
+            req = urllib.request.Request(url, headers={"User-Agent": "Hermes-Gateway/1.0"})
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read().decode()).get("data") or {}
+            endpoints = [e for e in (data.get("endpoints") or []) if e.get("status") == 0]
+            return endpoints or list(data.get("endpoints") or [])
+
+        def _routing_options(self, endpoints: list) -> list:
+            """Select options for the routing step: Auto, cheapest per hosted quantization,
+            fastest (when OpenRouter reports throughput), then each provider (strict).
+            Returns ``(value, label, description, routing_or_None)`` tuples where ``value``
+            is ``auto`` / ``quant:<q>`` / ``fast`` / ``prov:<slug>`` and ``routing`` is the
+            per-model ``provider:`` fragment (None = Auto, clears pins)."""
+            def _price_key(item):
+                return item[0] if item[0] is not None else float("inf")
+
+            best_quant: Dict[str, tuple] = {}
+            best_prov: Dict[str, tuple] = {}
+            for endpoint in endpoints:
+                slug = self._endpoint_provider_slug(endpoint)
+                if not slug:
+                    continue
+                price = self._endpoint_price_per_m(endpoint)
+                quant = str(endpoint.get("quantization") or "").strip().lower()
+                entry = (price, endpoint)
+                if quant and price is not None and (quant not in best_quant or price < best_quant[quant][0]):
+                    best_quant[quant] = entry
+                if slug not in best_prov or _price_key(entry) < _price_key(best_prov[slug]):
+                    best_prov[slug] = entry
+
+            options = [("auto", _t_discord("platform.discord.picker.routing_auto", _DISCORD_SELECT_FIELD_LIMIT), None, None)]
+            for quant, (price, endpoint) in sorted(best_quant.items(), key=lambda kv: kv[1][0]):
+                if quant == "unknown":
+                    continue  # unreported quantization — a pin would be meaningless
+                provider = endpoint.get("provider_name") or self._QUANT_LABELS.get(quant, quant)
+                options.append((
+                    f"quant:{quant}",
+                    _t_discord("platform.discord.picker.routing_cheapest", _DISCORD_SELECT_FIELD_LIMIT,
+                               quant=self._QUANT_LABELS.get(quant, quant.upper()), provider=provider),
+                    _t_discord("platform.discord.picker.routing_price", _DISCORD_SELECT_FIELD_LIMIT, price=f"{price:.2f}"),
+                    {"order": [self._endpoint_provider_slug(endpoint)], "allow_fallbacks": False,
+                     "quantizations": [quant]},
+                ))
+            fastest = max(
+                (e for e in endpoints
+                 if isinstance(e.get("throughput_last_30m"), (int, float)) and e["throughput_last_30m"] > 0),
+                key=lambda e: e["throughput_last_30m"], default=None)
+            if fastest is not None:
+                options.append((
+                    "fast",
+                    _t_discord("platform.discord.picker.routing_fastest", _DISCORD_SELECT_FIELD_LIMIT,
+                               provider=fastest.get("provider_name") or self._endpoint_provider_slug(fastest)),
+                    f"{fastest['throughput_last_30m']:.0f} tok/s (strict)",
+                    {"order": [self._endpoint_provider_slug(fastest)], "allow_fallbacks": False},
+                ))
+            for slug, (price, endpoint) in sorted(best_prov.items(), key=_price_key):
+                if len(options) >= _DISCORD_SELECT_MAX_OPTIONS:
+                    break
+                quant = str(endpoint.get("quantization") or "").strip().lower()
+                desc = (
+                    _t_discord("platform.discord.picker.routing_price", _DISCORD_SELECT_FIELD_LIMIT, price=f"{price:.2f}")
+                    if price is not None else self._QUANT_LABELS.get(quant, (quant or "?").upper()))
+                options.append((
+                    f"prov:{slug}",
+                    _t_discord("platform.discord.picker.routing_strict", _DISCORD_SELECT_FIELD_LIMIT,
+                               provider=endpoint.get("provider_name") or slug),
+                    desc, {"order": [slug], "allow_fallbacks": False},
+                ))
+            return options[:_DISCORD_SELECT_MAX_OPTIONS]
+
+        async def _maybe_show_routing_step(self, interaction, model_id: str) -> bool:
+            """Insert the upstream-routing select for OpenRouter models. False → fall through
+            to a plain switch (non-OpenRouter provider, endpoints fetch failed, or a single
+            un-pinnable endpoint)."""
+            if self._selected_provider != "openrouter":
+                return False
+            try:
+                endpoints = await asyncio.to_thread(self._openrouter_endpoints_sync, model_id)
+            except Exception:
+                logger.debug("OpenRouter endpoints fetch failed for %s", model_id, exc_info=True)
+                return False
+            options = self._routing_options(endpoints)
+            if len(options) <= 1:  # only Auto — nothing worth pinning
+                return False
+            self._routing_choices = {value: routing for value, _, _, routing in options}
+            self._pending_routing_model = model_id
+            self.clear_items()
+            # First row is a placeholder-style entry (user request): the collapsed
+            # select shows the Select's own placeholder text, and this row simply
+            # re-renders the step when clicked. Real choices start at "auto".
+            # NOTE: Discord string-select options cannot be truly disabled; this
+            # row is a no-op, not a disabled item.
+            menu_options = [
+                discord.SelectOption(
+                    label=_truncate_discord_component_text(
+                        _t_discord("platform.discord.picker.routing_menu_placeholder", _DISCORD_SELECT_FIELD_LIMIT),
+                        _DISCORD_SELECT_FIELD_LIMIT),
+                    value=_ROUTING_MENU_PLACEHOLDER,
+                )
+            ]
+            menu_options.extend(
+                discord.SelectOption(
+                    label=_truncate_discord_component_text(label, _DISCORD_SELECT_FIELD_LIMIT),
+                    value=value,
+                    description=_truncate_discord_component_text(desc, _DISCORD_SELECT_FIELD_LIMIT) if desc else None,
+                    # No `default` here: a default=True option is pre-selected, and
+                    # Discord skips the interaction when the selection doesn't
+                    # change — Auto was literally un-clickable with it set.
+                )
+                for value, label, desc, _ in options[: _DISCORD_SELECT_MAX_OPTIONS - 1]
+            )
+            select = discord.ui.Select(
+                placeholder=_t_discord("platform.discord.picker.routing_placeholder", _DISCORD_SELECT_PLACEHOLDER_LIMIT),
+                options=menu_options,
+                custom_id="model_routing_select",
+            )
+            select.callback = self._on_routing_selected
+            self.add_item(select)
+            self._add_button(_t_discord("platform.discord.picker.back", _DISCORD_BUTTON_LABEL_LIMIT), discord.ButtonStyle.grey, "model_routing_back", self._on_routing_back)
+            self._add_button(_t_discord("platform.discord.picker.cancel", _DISCORD_BUTTON_LABEL_LIMIT), discord.ButtonStyle.red, "model_routing_cancel", self._on_cancel)
+            await self._edit(interaction, _t_discord("platform.discord.picker.routing_select", 4000, model=model_id))
+            return True
+
+        async def _on_routing_selected(self, interaction: discord.Interaction):
+            if not await self._gate(interaction, resolved_msg=None, unauth_msg=_unauthorized()):
+                return
+            value = interaction.data["values"][0]
+            if value == _ROUTING_MENU_PLACEHOLDER:
+                # Placeholder row — not a choice; keep the same step on screen.
+                model_id = self._pending_routing_model or self.current_model
+                await self._edit(interaction, _t_discord("platform.discord.picker.routing_select", 4000, model=model_id))
+                return
+            model_id = self._pending_routing_model or self.current_model
+            routing = self._routing_choices.get(value)
+            await self._switch_selected_model(interaction, model_id, provider_routing=routing)
+
+        async def _on_routing_back(self, interaction: discord.Interaction):
+            if not await self._gate(interaction, resolved_msg=None, unauth_msg=_unauthorized()):
+                return
+            provider = next((p for p in self.providers if p["slug"] == self._selected_provider), None)
+            pname = provider.get("name", self._selected_provider) if provider else self._selected_provider
+            self._build_model_select(self._selected_provider)
+            await self._edit(interaction, _t_discord("platform.discord.picker.select_model", 4000, provider=pname, extra=""))
 
         def _add_button(self, label: str, style, custom_id: str, callback) -> None:
             btn = discord.ui.Button(label=label, style=style, custom_id=custom_id)
@@ -7024,7 +7205,7 @@ def _define_discord_view_classes() -> None:
             extra = f"\n*{t('platform.discord.picker.more_available', count=str(total - shown))}*" if total > shown else ""
             await self._edit(interaction, t("platform.discord.picker.select_model", provider=pname, extra=extra))
 
-        async def _switch_selected_model(self, interaction: discord.Interaction, model_id: str):
+        async def _switch_selected_model(self, interaction: discord.Interaction, model_id: str, provider_routing: Optional[dict] = None):
             if not await self._gate(interaction, resolved_msg=t("platform.discord.picker.already_resolved"), unauth_msg=_unauthorized()):
                 return
             self.resolved = True
@@ -7033,7 +7214,19 @@ def _define_discord_view_classes() -> None:
                 interaction, t("platform.discord.picker.switching", model=model_id),
                 title=t("platform.discord.picker.switching_title"), view=None)
             try:
-                result_text = await self.on_model_selected(str(interaction.channel_id), model_id, self._selected_provider)
+                callback = self.on_model_selected
+                # Newer gateway callbacks accept a 4th ``provider_routing`` arg; 3-arg
+                # callables (older integrations, tests) keep working unchanged.
+                try:
+                    sig = inspect.signature(callback)
+                    accepts_routing = any(p.kind == p.VAR_KEYWORD for p in sig.parameters.values()) or (
+                        "provider_routing" in sig.parameters)
+                except (TypeError, ValueError):
+                    accepts_routing = True
+                if accepts_routing:
+                    result_text = await callback(str(interaction.channel_id), model_id, self._selected_provider, provider_routing)
+                else:
+                    result_text = await callback(str(interaction.channel_id), model_id, self._selected_provider)
             except Exception as exc:
                 result_text = t("platform.discord.picker.switch_error", error=str(exc))
             await interaction.edit_original_response(
@@ -7050,6 +7243,8 @@ def _define_discord_view_classes() -> None:
                 self._build_expensive_confirm(model_id)
                 await self._edit(interaction, warning.message, title=f"⚠ {warning.title}", color=discord.Color.red())
                 return
+            if await self._maybe_show_routing_step(interaction, model_id):
+                return
             await self._switch_selected_model(interaction, model_id)
 
         async def _on_expensive_confirm(self, interaction: discord.Interaction):
@@ -7057,6 +7252,8 @@ def _define_discord_view_classes() -> None:
                 return
             if not self._pending_expensive_model:
                 await interaction.response.send_message(t("platform.discord.picker.expired_toast"), ephemeral=True)
+                return
+            if await self._maybe_show_routing_step(interaction, self._pending_expensive_model):
                 return
             await self._switch_selected_model(interaction, self._pending_expensive_model)
 

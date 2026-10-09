@@ -22,7 +22,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from hermes_cli.timeouts import get_provider_request_timeout, get_provider_stale_timeout
 from hermes_constants import PARTIAL_STREAM_STUB_ID, FINISH_REASON_LENGTH
@@ -57,6 +57,8 @@ from utils import base_url_host_matches, base_url_hostname, env_float, env_int
 
 logger = logging.getLogger(__name__)
 _OPENROUTER_PROVIDER_SORT_VALUES = {"throughput", "latency", "price"}
+# OpenRouter endpoint quantizations (docs: api/v1/models/{id}/endpoints -> quantization).
+_OPENROUTER_QUANTIZATION_VALUES = {"int4", "int8", "fp4", "fp6", "fp8", "bf16", "fp16", "none"}
 _PROVIDER_STREAM_ERROR_FINISH_REASONS = {"error", "error_finish"}
 _PROVIDER_STREAM_SSE_FIELDS = {"event", "data", "id", "retry"}
 _PROVIDER_STREAM_ERROR_TEXT_LIMIT = 4096
@@ -466,25 +468,56 @@ def _validated_openrouter_provider_sort(raw_sort: Any) -> Optional[str]:
     return None
 
 
+def _validated_openrouter_quantizations(raw: Any) -> Optional[List[str]]:
+    """Return a normalized OpenRouter provider.quantizations list or None."""
+    if not isinstance(raw, (list, tuple)):
+        return None
+    values = []
+    for item in raw:
+        q = str(item).strip().lower()
+        if not q:
+            continue
+        if q not in _OPENROUTER_QUANTIZATION_VALUES:
+            logger.warning("Ignoring invalid OpenRouter provider.quantizations value %r (allowed: %s)", item,
+                ", ".join(sorted(_OPENROUTER_QUANTIZATION_VALUES)))
+            continue
+        if q not in values:
+            values.append(q)
+    return values or None
+
+
 def _provider_preferences_for_agent(agent) -> Dict[str, Any]:
     """Build the validated provider-routing object shared by request paths.
 
     ``provider_routing.models.<id>`` overlays the flat constructor values for the CURRENT
     ``agent.model`` (so ``/model`` switches, fallbacks, and delegated children on another
     model each get their own pins without any surface re-plumbing the kwargs)."""
-    flat = {"only": agent.providers_allowed, "ignore": agent.providers_ignored, "order": agent.providers_order,
-        "sort": agent.provider_sort, "require_parameters": agent.provider_require_parameters,
-        "data_collection": agent.provider_data_collection}
-    per_model = {}
+    # Load flat defaults from config.provider_routing (sort, allow_fallbacks, quantizations)
+    config_pr = {}
     with contextlib.suppress(Exception):
         from hermes_cli.config import load_config_readonly
+        config_pr = load_config_readonly().get("provider_routing") or {}
+
+    flat = {"only": agent.providers_allowed, "ignore": agent.providers_ignored, "order": agent.providers_order,
+        "sort": agent.provider_sort or config_pr.get("sort"),
+        "require_parameters": agent.provider_require_parameters,
+        "data_collection": agent.provider_data_collection,
+        "allow_fallbacks": getattr(agent, "provider_allow_fallbacks", None) if getattr(agent, "provider_allow_fallbacks", None) is not None else config_pr.get("allow_fallbacks"),
+        "quantizations": getattr(agent, "provider_quantizations", None) or config_pr.get("quantizations")}
+    per_model = {}
+    with contextlib.suppress(Exception):
         from hermes_constants import resolve_per_model_provider_routing
-        _pr = load_config_readonly().get("provider_routing")
-        per_model = resolve_per_model_provider_routing(agent.model, (_pr or {}).get("models") if isinstance(_pr, dict) else None)
+        per_model = resolve_per_model_provider_routing(agent.model, (config_pr or {}).get("models") if isinstance(config_pr, dict) else None)
     merged = {**flat, **{k: v for k, v in per_model.items() if k in flat}}
     merged["sort"] = _validated_openrouter_provider_sort(merged["sort"])
     merged["require_parameters"] = True if merged["require_parameters"] else None
-    return {key: value for key, value in merged.items() if value}
+    # allow_fallbacks: only False is meaningful on wire (strict pin); True/None = OpenRouter default (fallbacks allowed)
+    # But we preserve True explicitly so the config intent is clear in logs/debugging.
+    merged["allow_fallbacks"] = False if merged.get("allow_fallbacks") is False else merged.get("allow_fallbacks")
+    merged["quantizations"] = _validated_openrouter_quantizations(merged.get("quantizations"))
+    # None drops unset keys; empty containers (e.g. ``only: []``) must not reach the wire either.
+    return {key: value for key, value in merged.items()
+            if value is not None and not (isinstance(value, (list, dict, str)) and not value)}
 
 
 def _prompt_cache_scope_for_agent(agent) -> "str | None":

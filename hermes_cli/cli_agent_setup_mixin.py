@@ -682,6 +682,8 @@ class CLIAgentSetupMixin:
                 provider_sort=self._provider_sort,
                 provider_require_parameters=self._provider_require_params,
                 provider_data_collection=self._provider_data_collection,
+                provider_allow_fallbacks=self._provider_allow_fallbacks,
+                provider_quantizations=self._provider_quantizations,
                 openrouter_min_coding_score=self._openrouter_min_coding_score,
                 session_id=self.session_id, platform="cli", session_db=self._session_db,
                 clarify_callback=clarify_callback, connection_callback=connection_callback,

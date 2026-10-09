@@ -388,6 +388,69 @@ _remove_role = _mutation(
     "Role {role_id} removed from user {user_id}.")
 
 
+
+
+def _play_voice_audio(token: str, guild_id: str, audio_path: str, **_kwargs: Any) -> str:
+    """Play an audio file in the guild's voice channel via the gateway's voice connection.
+    
+    Requires the bot to already be connected to a voice channel in the guild.
+    Supports MP3, WAV, OGG formats. The audio is played through the existing
+    voice connection (not as a file attachment).
+    """
+    # Access the gateway runner to get the Discord adapter
+    try:
+        from gateway.run import _gateway_runner_ref
+        runner = _gateway_runner_ref()
+    except Exception:
+        return json.dumps({"success": False, "error": "Gateway runner not available"})
+    
+    if runner is None:
+        return json.dumps({"success": False, "error": "No active gateway runner (not running in gateway mode?)"})
+    
+    adapter = runner.adapters.get("discord")
+    if adapter is None:
+        return json.dumps({"success": False, "error": "Discord adapter not found in gateway"})
+    
+    # Check if bot is in voice channel for this guild
+    try:
+        gid_int = int(guild_id)
+    except ValueError:
+        return json.dumps({"success": False, "error": f"Invalid guild_id: {guild_id}"})
+    
+    if not adapter.is_in_voice_channel(gid_int):
+        return json.dumps({
+            "success": False, 
+            "error": f"Bot is not connected to a voice channel in guild {guild_id}. Join a voice channel first."
+        })
+    
+    # Check if file exists
+    import os
+    if not os.path.isfile(audio_path):
+        return json.dumps({"success": False, "error": f"Audio file not found: {audio_path}"})
+    
+    # Play the audio in the voice channel
+    import asyncio
+    try:
+        # Run the async play_in_voice_channel in the event loop
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            # Schedule it
+            future = asyncio.run_coroutine_threadsafe(
+                adapter.play_in_voice_channel(gid_int, audio_path), loop
+            )
+            success = future.result(timeout=30)
+        else:
+            success = loop.run_until_complete(adapter.play_in_voice_channel(gid_int, audio_path))
+        
+        return json.dumps({
+            "success": success,
+            "guild_id": guild_id,
+            "audio_file": os.path.basename(audio_path)
+        })
+    except Exception as e:
+        return json.dumps({"success": False, "error": f"Playback failed: {e}"})
+
+
 # ── action dispatch + metadata ───────────────────────────────────────────────
 # Single source of truth: (action, handler, required-param signature, description). Order is
 # the schema/enum order; the signature drives runtime required-param validation.
@@ -407,6 +470,7 @@ _ACTION_MANIFEST = [
     ("create_thread", _create_thread, "(channel_id, name)", "create a public thread; optional message_id anchor"),
     ("add_role", _add_role, "(guild_id, user_id, role_id)", "assign a role"),
     ("remove_role", _remove_role, "(guild_id, user_id, role_id)", "remove a role"),
+    ("play_voice_audio", _play_voice_audio, "(guild_id, audio_path)", "play audio file in guild's voice channel"),
 ]
 _ACTIONS = {name: fn for name, fn, _sig, _desc in _ACTION_MANIFEST}
 _REQUIRED_PARAMS: Dict[str, List[str]] = {
@@ -492,6 +556,10 @@ _SCHEMA_PROPERTIES: Dict[str, Any] = {
         "type": "integer",
         "enum": [60, 1440, 4320, 10080],
         "description": "Thread archive duration in minutes (create_thread, default 1440).",
+    },
+    "audio_path": {
+        "type": "string",
+        "description": "Absolute path to audio file (MP3, WAV, OGG) to play in the voice channel.",
     },
 }
 

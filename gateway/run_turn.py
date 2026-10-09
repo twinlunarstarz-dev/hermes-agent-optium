@@ -2474,6 +2474,8 @@ class GatewayTurnMixin:
                     provider_sort=pr.get("sort"),
                     provider_require_parameters=pr.get("require_parameters", False),
                     provider_data_collection=pr.get("data_collection"),
+                    provider_allow_fallbacks=pr.get("allow_fallbacks"),
+                    provider_quantizations=pr.get("quantizations"),
                     session_id=task_id,
                     platform=platform_key,
                     **{k: getattr(source, k) for k in (

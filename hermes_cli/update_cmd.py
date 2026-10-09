@@ -1142,16 +1142,18 @@ def _prepare_checkout_for_update(
     # the official repo, so "Already up to date!" is fully verified there.
     upstream_checked = True
     if commit_count == 0 and is_fork and branch == "main" and not release_tag:
-        pre_sync_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
-        upstream_checked = _m()._sync_with_upstream_if_needed(
-            git_cmd, _m().PROJECT_ROOT, assume_yes=assume_yes, input_fn=gw_input_fn)
-        post_sync_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
-        if pre_sync_sha and post_sync_sha and pre_sync_sha != post_sync_sha:
-            synced_count = _count_commits_between(
-                git_cmd, _m().PROJECT_ROOT, pre_sync_sha, post_sync_sha)
-            # HEAD moving is proof of an update even if the count can't be read.
-            commit_count = max(1, synced_count)
-            moved_from_sha = moved_from_sha or pre_sync_sha
+        # Respect updates.sync_upstream config option
+        if _updates_config().get("sync_upstream", True):
+            pre_sync_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
+            upstream_checked = _m()._sync_with_upstream_if_needed(
+                git_cmd, _m().PROJECT_ROOT, assume_yes=assume_yes, input_fn=gw_input_fn)
+            post_sync_sha = _capture_head_sha(git_cmd, _m().PROJECT_ROOT)
+            if pre_sync_sha and post_sync_sha and pre_sync_sha != post_sync_sha:
+                synced_count = _count_commits_between(
+                    git_cmd, _m().PROJECT_ROOT, pre_sync_sha, post_sync_sha)
+                # HEAD moving is proof of an update even if the count can't be read.
+                commit_count = max(1, synced_count)
+                moved_from_sha = moved_from_sha or pre_sync_sha
 
     return _CheckoutPlan(
         auto_stash_ref=auto_stash_ref, commit_count=commit_count, in_place_update=in_place_update,
@@ -1602,12 +1604,14 @@ def _cmd_update_impl(args, gateway_mode: bool):
             print("→ Updates available (commit count unknown on this shallow checkout)")
 
         print("→ Pulling updates...")
+        # Respect updates.sync_upstream config option
+        sync_upstream_enabled = is_fork and branch == "main" and not release_sha and _updates_config().get("sync_upstream", True)
         movement_baseline = _pull_updates(
             git_cmd, branch, _plan.auto_stash_ref, prompt_for_restore=_plan.prompt_for_restore,
             gw_input_fn=gw_input_fn, discard_local_changes=opts.discard_local_changes,
             keep_stash=opts.keep_stash, target_ref=target_ref, pre_sync_sha=_plan.pre_sync_sha,
             rollback_branch=_plan.rollback_branch,
-            sync_upstream=is_fork and branch == "main" and not release_sha, assume_yes=assume_yes,
+            sync_upstream=sync_upstream_enabled, assume_yes=assume_yes,
             in_place_update=_plan.in_place_update, _windows_gateway_resume=_windows_gateway_resume)
         _apply_pulled_update(
             git_cmd, branch, movement_baseline, _plan,
