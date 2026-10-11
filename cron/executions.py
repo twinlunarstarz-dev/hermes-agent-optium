@@ -412,6 +412,21 @@ def list_executions(
     return [dict(row) for row in rows]
 
 
+def delete_terminal_executions(execution_ids: List[str]) -> int:
+    """Delete finished ledger rows by id. Running/claimed rows are never removed."""
+    ids = [str(eid) for eid in (execution_ids or ()) if eid]
+    if not ids:
+        return 0
+    placeholders = ",".join("?" for _ in ids)
+    with _transaction() as conn:
+        cursor = conn.execute(
+            f"DELETE FROM executions WHERE id IN ({placeholders}) "
+            "AND status IN ('completed', 'failed', 'unknown')",
+            ids,
+        )
+        return cursor.rowcount
+
+
 def get_execution(execution_id: str) -> Optional[Dict[str, Any]]:
     """Return one exact execution attempt, or ``None`` when it is absent."""
     with _transaction() as conn:

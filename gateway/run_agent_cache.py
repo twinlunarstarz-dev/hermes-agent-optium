@@ -460,6 +460,16 @@ class GatewayAgentCacheMixin:
             with _log_suppressed(logging.WARNING, "Failed to interrupt running agent for %s; continuing",
                                  session_key, exc_info=True):
                 request_hard_interrupt(running_agent, interrupt_reason, tool_reason=tool_reason)
+            # The successor slot's agent may wait on a turn lease a superseded turn of this process still
+            # holds (its slot was reassigned, so it is not reachable above). Stop those too, or /stop
+            # leaves that turn running and renewing the lease, and every later message waits on it.
+            from agent.turn_facade_lease import preempt_live_turn_leases
+            with _log_suppressed(logging.WARNING, "Failed to preempt superseded turn leases for %s; continuing",
+                                 session_key, exc_info=True):
+                preempt_live_turn_leases(
+                    str(getattr(running_agent, "session_id", "") or ""), interrupt_reason or "",
+                    exclude=running_agent,
+                )
             _process_task_id = getattr(running_agent, "_gateway_turn_process_task_id", "")
             _process_baseline = getattr(running_agent, "_gateway_turn_process_baseline", None)
         # Bump the generation BEFORE scheduling the reap thread and capture the post-bump value:

@@ -186,11 +186,17 @@ def _reject_delegated_child_mutation(tool_name: str) -> None:
             "configured Kanban orchestrator must perform board mutations.")
 
 
+_TASK_ID_PLACEHOLDERS = frozenset({
+    "HERMES_KANBAN_TASK", "$HERMES_KANBAN_TASK", "${HERMES_KANBAN_TASK}",
+})
+
+
 def _default_task_id(arg: Optional[str]) -> Optional[str]:
     """``task_id`` arg or the dispatcher's env var. A delegate child or an
-    in-process cron job must never inherit the worker's task id implicitly."""
-    if arg:
-        return arg
+    in-process cron job must never inherit the worker's task id implicitly.
+    The literal env-var name is a placeholder, not a task id, so it is ignored."""
+    if arg and str(arg).strip() not in _TASK_ID_PLACEHOLDERS:
+        return str(arg).strip()
     if _is_delegated_child_context() or not _is_dispatcher_owned_worker():
         return None
     return os.environ.get("HERMES_KANBAN_TASK") or None

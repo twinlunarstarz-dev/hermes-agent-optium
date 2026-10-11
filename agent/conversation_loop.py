@@ -1407,9 +1407,9 @@ class _LoopState:
     active_system_prompt: Any
     current_turn_user_idx: Any
     _preflight_compression_blocked: Any
-    # Compression attempt cap shared by the pre-API gate, 413 handlers and post-tool compaction:
-    # a consecutive-ineffective-attempt backstop, rearmed only after a provider response
-    # reports a prompt below threshold.
+    # Compression attempt cap shared by the pre-API gate, 413 handlers and post-tool compaction.
+    # Reset at every completed tool round (run_tool_round), and rearmed mid-round only after a
+    # provider response reports a prompt below threshold.
     max_compression_attempts: Any
     api_call_count: int = 0
     final_response: Any = None

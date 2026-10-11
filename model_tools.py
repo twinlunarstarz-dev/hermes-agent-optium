@@ -212,20 +212,24 @@ def _clear_tool_defs_cache() -> None:
 
 
 def get_tool_definitions(enabled_toolsets: Optional[List[str]] = None, disabled_toolsets: Optional[List[str]] = None,
-                         quiet_mode: bool = False, skip_tool_search_assembly: bool = False) -> List[Dict[str, Any]]:
+                         quiet_mode: bool = False, skip_tool_search_assembly: bool = False,
+                         platform: Optional[str] = None) -> List[Dict[str, Any]]:
     """Tool definitions for model API calls, filtered by toolset.
 
     enabled_toolsets None = all; disabled_toolsets are subtracted after enabling.
     quiet_mode suppresses status prints and enables memoization.
     skip_tool_search_assembly returns raw schemas for every enabled tool — only
     the tool_search bridge should use it (it reads the real, uncollapsed catalog).
+    platform scopes the tool-search deferral default (interactive Discord/CLI get
+    the bridge-only surface); explicit user config always wins.
     """
     def compute():
         return _compute_tool_definitions(enabled_toolsets, disabled_toolsets, quiet_mode,
-                                         skip_tool_search_assembly=skip_tool_search_assembly)
+                                         skip_tool_search_assembly=skip_tool_search_assembly,
+                                         platform=platform)
     if not quiet_mode:
         return compute()
-    cache_key = _tool_defs_cache_key(enabled_toolsets, disabled_toolsets, skip_tool_search_assembly)
+    cache_key = _tool_defs_cache_key(enabled_toolsets, disabled_toolsets, skip_tool_search_assembly, platform)
     # Cache the freshly-computed list, but hand callers a shallow copy so downstream mutations (e.g.
     # run_agent appending memory/LCM tool schemas to self.tools) don't poison the cache. Without this, a
     # long-lived Gateway process accumulates duplicate tool names across agent inits and providers that
@@ -255,6 +259,7 @@ def get_tool_definitions(enabled_toolsets: Optional[List[str]] = None, disabled_
 
 def _tool_defs_cache_key(
     enabled_toolsets: Optional[List[str]], disabled_toolsets: Optional[List[str]], skip_tool_search_assembly: bool,
+    platform: Optional[str] = None,
 ) -> Optional[tuple]:
     """Memo key for get_tool_definitions, or None when caching must be bypassed.
 
@@ -276,6 +281,7 @@ def _tool_defs_cache_key(
         frozenset(disabled_toolsets) if disabled_toolsets else None, registry._generation, cfg_fp,
         bool(os.environ.get("HERMES_KANBAN_TASK")), bool(skip_tool_search_assembly),
         _is_delegated_child_context(), _is_dispatcher_owned_worker(), profile_scope,
+        str(platform or ""),
     )
 
 
@@ -504,7 +510,8 @@ _TOOL_SEARCH_LISTING_FORMS = {
 
 
 def _compute_tool_definitions(enabled_toolsets: Optional[List[str]] = None, disabled_toolsets: Optional[List[str]] = None,
-                              quiet_mode: bool = False, skip_tool_search_assembly: bool = False) -> List[Dict[str, Any]]:
+                              quiet_mode: bool = False, skip_tool_search_assembly: bool = False,
+                              platform: Optional[str] = None) -> List[Dict[str, Any]]:
     """Uncached implementation of :func:`get_tool_definitions`."""
     tools_to_include = _select_tool_names(enabled_toolsets, disabled_toolsets, quiet_mode)
     # Selection is per schema, not per process/profile. Kanban's local checks
@@ -531,8 +538,8 @@ def _compute_tool_definitions(enabled_toolsets: Optional[List[str]] = None, disa
     # configured share of the context window. Core tools are never deferred.
     # Must be the LAST step (after sanitization); idempotent if called twice.
     try:
-        from tools.tool_search import assemble_tool_defs, load_config as _load_ts_config
-        ts_cfg = _load_ts_config()
+        from tools.tool_search import assemble_tool_defs, load_config_for_platform as _load_ts_config
+        ts_cfg = _load_ts_config(platform)
         if not skip_tool_search_assembly and ts_cfg.enabled != "off":
             assembly = assemble_tool_defs(filtered_tools, context_length=_resolve_active_context_length(), config=ts_cfg)
             if assembly.activated and not quiet_mode:
@@ -705,7 +712,8 @@ def _emit_post_tool_call_hook(
 
 
 def _dispatch_bridge_tool(function_name: str, function_args: Dict[str, Any],
-                          enabled_toolsets: Optional[List[str]], disabled_toolsets: Optional[List[str]]):
+                          enabled_toolsets: Optional[List[str]], disabled_toolsets: Optional[List[str]],
+                          platform: Optional[str] = None):
     """Handle a Tool Search bridge call (tool_search / tool_describe / tool_call).
 
     None when *function_name* is not a bridge tool; ``(result, None)`` for a
@@ -722,7 +730,7 @@ def _dispatch_bridge_tool(function_name: str, function_args: Dict[str, Any],
     # session (subagent, kanban worker) can't reach the whole registry via the bridge.
     try:
         current_defs = get_tool_definitions(enabled_toolsets=enabled_toolsets, disabled_toolsets=disabled_toolsets,
-                                            quiet_mode=True, skip_tool_search_assembly=True) or []
+                                            quiet_mode=True, skip_tool_search_assembly=True, platform=platform) or []
     except Exception:
         current_defs = []
     args = function_args or {}
@@ -903,7 +911,9 @@ def handle_function_call(
     # Tool Search bridge: tool_search / tool_describe are catalog reads handled
     # inline; tool_call is unwrapped so every downstream hook (pre/post, edit
     # approval, guardrails) sees the real tool name, never the bridge.
-    bridged = _dispatch_bridge_tool(function_name, function_args, enabled_toolsets, disabled_toolsets)
+    from tools.tool_search_session import session_platform as _session_platform
+    bridged = _dispatch_bridge_tool(function_name, function_args, enabled_toolsets, disabled_toolsets,
+                                    platform=_session_platform())
     if bridged is not None:
         result, underlying = bridged
         if underlying is None:

@@ -22,7 +22,7 @@ _MCP_INJECTION_PATTERNS = [
         (r"your\s+new\s+(task|role|instructions?)\s+(is|are)", "task override attempt"),
         (r"system\s*:\s*", "system prompt injection attempt"),
         (r"<\s*(system|human|assistant)\s*>", "role tag injection attempt"),
-        (r"do\s+not\s+(tell|inform|mention|reveal)", "concealment instruction"),
+        (r"do\s+not\s+(tell|inform|mention|reveal)\s+(the\s+)?(user|users|human|people|anyone|the\s+person)\b", "concealment instruction"),
         (r"(curl|wget|fetch)\s+https?://", "network command in description"),
         (r"base64\.(b64decode|decodebytes)", "base64 decode reference"),
         (r"exec\s*\(|eval\s*\(", "code execution reference"),

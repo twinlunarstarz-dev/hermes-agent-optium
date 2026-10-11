@@ -22,7 +22,7 @@ from agent.prompt_builder import (
     ASYNC_HANDOFF_GUIDANCE, DEFAULT_AGENT_IDENTITY, EXECUTION_GUIDANCE_MODELS, GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
     HERMES_AGENT_HELP_GUIDANCE, HERMES_AGENT_HELP_GUIDANCE_NO_SKILLS, KANBAN_GUIDANCE,
     PARALLEL_TOOL_CALL_GUIDANCE, PLATFORM_HINTS, SESSION_SEARCH_GUIDANCE,
-    SKILLS_GUIDANCE, STEER_CHANNEL_NOTE, TASK_COMPLETION_GUIDANCE, TELEGRAM_RICH_MESSAGES_HINT,
+    SKILLS_GUIDANCE, SKILLS_GUIDANCE_NO_INDEX, STEER_CHANNEL_NOTE, TASK_COMPLETION_GUIDANCE, TELEGRAM_RICH_MESSAGES_HINT,
     TOOL_USE_ENFORCEMENT_GUIDANCE, TOOL_USE_ENFORCEMENT_MODELS, drain_truncation_warnings,
 )
 from agent import prompt_builder as _pb
@@ -292,15 +292,28 @@ def _tool_guidance_block(agent: Any) -> Optional[str]:
     tool_guidance = [
         memory_guidance,
         SESSION_SEARCH_GUIDANCE if "session_search" in names else None,
-        SKILLS_GUIDANCE if "skill_manage" in names else None,
+        (SKILLS_GUIDANCE if _skills_index_in_prompt() else SKILLS_GUIDANCE_NO_INDEX) if "skill_manage" in names else None,
         _kanban_guidance,
     ]
     return " ".join(g for g in tool_guidance if g) or None
 
 
+def _skills_index_in_prompt() -> bool:
+    """``skills.index_in_prompt`` (default true). False leaves the skills index out of the
+    system prompt; skills are then found through tool_search and the skill tools."""
+    try:
+        from hermes_cli.config import load_config_readonly
+        value = ((load_config_readonly() or {}).get("skills") or {}).get("index_in_prompt", True)
+    except Exception:
+        return True
+    return value is not False and str(value).strip().lower() not in ("false", "off", "no", "0")
+
+
 def _skills_prompt(agent: Any) -> str:
     """Skills index (empty without skills tools).  Focus mode demotes non-coding
     categories to names-only — never hidden, every name stays visible."""
+    if not _skills_index_in_prompt():
+        return ""
     if not any(name in agent.valid_tool_names for name in ['skills_list', 'skill_view', 'skill_manage']):
         return ""
     import model_tools

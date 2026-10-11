@@ -1124,9 +1124,10 @@ def _load_tools(agent, enabled_toolsets, disabled_toolsets):
     except Exception:
         agent._tool_snapshot_generation = 0
     import model_tools
+    # Platform scopes the tool-search deferral default (Discord/CLI -> bridge-only surface).
     agent.tools = model_tools.get_tool_definitions(
         enabled_toolsets=enabled_toolsets, disabled_toolsets=disabled_toolsets,
-        quiet_mode=agent.quiet_mode,
+        quiet_mode=agent.quiet_mode, platform=getattr(agent, "platform", None),
     )
     # A finite -q run has no later session to learn for: no skill authoring tool (agent/oneshot_footprint.py).
     from agent.oneshot_footprint import prune_oneshot_tools
@@ -1387,6 +1388,10 @@ def _init_memory(agent, _agent_cfg, skip_memory, platform, memory_manager=None):
 
     from agent.memory_manager import inject_memory_provider_tools
     inject_memory_provider_tools(agent)
+    _apply_bridge_extras(agent)
+
+
+from agent.tool_bridge_extras import apply_bridge_extras as _apply_bridge_extras  # noqa: E402
 
 
 def _apply_agent_section(agent, _agent_cfg):
@@ -1534,8 +1539,9 @@ def _parse_compression_config(agent, _agent_cfg) -> CompressionSettings:
     # Plain int()/float() coercions raise on garbage; evaluated up front, in config order.
     target_ratio = float(cfg.get("target_ratio", 0.20))
     protect_last = int(cfg.get("protect_last_n", 20))
-    # max_attempts: retry rounds before "max compression attempts reached"; some sessions
-    # need >3 (incompressible tool schemas). Default 3, floor 1, cap 10.
+    # max_attempts: compression passes allowed per tool round (budget resets after each tool
+    # call) before "max compression attempts reached"; some sessions need >3 (incompressible
+    # tool schemas). Default 3, floor 1, cap 10.
     max_attempts = _parse_config_int(cfg.get("max_attempts", 3), 3)
     if max_attempts < 1:
         max_attempts = 3
@@ -2152,6 +2158,7 @@ def _inject_context_engine_tools(agent):
             agent.tools.append({"type": "function", "function": _schema})
             for _names in (agent.valid_tool_names, agent._context_engine_tool_names, _existing_tool_names):
                 _names.add(_tname)
+        _apply_bridge_extras(agent)
 
     if agent.context_compressor:
         try:

@@ -71,10 +71,10 @@ def _tool_definition():
 
 @pytest.mark.parametrize(
     ("prompt_tokens", "expected_compactions", "provider_recovery"),
-    [(50, 1, False), (150, 1, False), (50, 2, True)],
+    [(50, 1, False), (150, 2, False), (50, 2, True)],
     ids=[
         "pressure-cleared-anchored-no-recompaction",
-        "pressure-still-high-stays-capped",
+        "pressure-still-high-recompacts-each-tool-round",
         "pressure-cleared-rearms-after-provider-recovery",
     ],
 )
@@ -93,6 +93,11 @@ def test_pre_api_compression_budget_rearms_only_after_pressure_clears(
     (the pre-anchor one). The budget-rearm mechanics remain covered by the
     provider-recovery variant, whose first response carries no usage (no
     anchor) and therefore still compacts on the rough estimate.
+
+    The still-high variant compacts twice: the pre-API pass before the first
+    request, then the post-tool pass after the tool round. A completed tool round
+    opens a fresh budget, so a provider reading still over threshold compacts
+    again; the no-recycle rule applies within a single round.
     """
     with (
         patch("model_tools.get_tool_definitions", return_value=[_tool_definition()]),

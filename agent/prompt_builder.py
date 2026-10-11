@@ -264,6 +264,12 @@ SKILLS_GUIDANCE = (
     "remaining `[SKILL_PRUNED]` markers for that same skill; they are historical artifacts of earlier compactions."
 )
 
+SKILLS_GUIDANCE_NO_INDEX = (
+    "Skills are not listed in this prompt. To find a skill, call tool_search with its topic, then "
+    "tool_call skills_list (to list) or skill_view (to load one by its exact name).\n\n"
+    + SKILLS_GUIDANCE
+)
+
 KANBAN_GUIDANCE = (
     "# Kanban task execution protocol\n"
     "You have been assigned ONE task from the shared board at `~/.hermes/kanban.db`. Your task id is in "

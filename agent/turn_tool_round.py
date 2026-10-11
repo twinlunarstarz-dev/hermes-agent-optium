@@ -40,6 +40,8 @@ class ToolRoundVerdict:
     _turn_exit_reason: Any
     truncated_tool_call_retries: Any
     current_turn_user_idx: Any
+    _preflight_compression_blocked: Any
+    _last_preflight_pressure: Any
     result: Optional[Dict[str, Any]] = None
 
 
@@ -49,6 +51,7 @@ def run_tool_round(
     system_message: Any, active_system_prompt: Any, compression_attempts: Any,
     max_compression_attempts: Any, final_response: Any, failed: Any, _turn_exit_reason: Any,
     truncated_tool_call_retries: Any, current_turn_user_idx: Any,
+    _preflight_compression_blocked: Any = False, _last_preflight_pressure: Any = None,
 ) -> ToolRoundVerdict:
     """Execute one tool round in the exact original order. Persist-before-execute is a
     durability invariant: resume must see the executed block if a destructive tool restarts
@@ -63,6 +66,8 @@ def run_tool_round(
             final_response=final_response, failed=failed, _turn_exit_reason=_turn_exit_reason,
             truncated_tool_call_retries=truncated_tool_call_retries,
             current_turn_user_idx=current_turn_user_idx, result=result,
+            _preflight_compression_blocked=_preflight_compression_blocked,
+            _last_preflight_pressure=_last_preflight_pressure,
         )
 
     if not agent.quiet_mode:
@@ -190,6 +195,12 @@ def run_tool_round(
     if {tc.function.name for tc in assistant_message.tool_calls} == {"execute_code"}:
         agent.iteration_budget.refund()
 
+    # A completed tool round is new evidence: it opens a fresh compression budget
+    # (``max_compression_attempts`` per round) and clears the previous pass's no-progress
+    # latch and pressure baseline, so the next over-threshold request is always compacted.
+    compression_attempts = 0
+    _preflight_compression_blocked = False
+    _last_preflight_pressure = None
     _ptc = compress_after_tool_results(
         agent, messages=messages, system_message=system_message, user_message=user_message,
         active_system_prompt=active_system_prompt, conversation_history=conversation_history,

@@ -14,7 +14,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 
 from hermes_cli.web_deps import late
@@ -259,10 +259,11 @@ def _cron_output_status_label(job: Optional[Dict[str, Any]]) -> str:
     return status.replace("_", " ").upper()
 
 
-def _cron_output_run_row(started_at: float, title: str, preview: Optional[str]) -> Dict[str, Any]:
+def _cron_output_run_row(started_at: float, title: str, preview: Optional[str], error_detail: Optional[str] = None) -> Dict[str, Any]:
     return {
         "title": title,
         "preview": preview or None,
+        "error_detail": error_detail,
         "source": "cron_output",
         "started_at": started_at,
         "last_active": started_at,
@@ -306,6 +307,7 @@ def _owner_profile_executions(canonical_job_id: str) -> List[Dict[str, Any]]:
         if str(row.get("status") or "") not in ("completed", "failed", "unknown"):
             continue
         terminal.append({
+            "id": str(row.get("id") or ""),
             "claimed_at": _iso_to_epoch(row.get("claimed_at")) or 0.0,
             "finished_at": _iso_to_epoch(row.get("finished_at")),
             "status": str(row.get("status") or ""),
@@ -386,16 +388,18 @@ def _list_cron_output_runs(
                 started_at = 0.0
         preview = _cron_output_run_preview(path)
         title = preview or "Script-only run"
+        doc_error = None
         for index, attempt in enumerate(executions):
             if attempt["status"] not in ("completed", "failed"):
                 continue
             if _execution_contains(attempt, started_at):
                 represented.add(index)
                 title = _execution_status_title(attempt["status"], attempt["error"], title)
+                doc_error = attempt["error"] or None
                 break
         runs.append({
             "id": f"cron_output:{canonical_job_id}:{path.stem}",
-            **_cron_output_run_row(started_at, title, preview),
+            **_cron_output_run_row(started_at, title, preview, doc_error),
         })
 
     # Terminal attempts whose output doc is gone (pruned, or the run never
@@ -410,10 +414,11 @@ def _list_cron_output_runs(
         when = attempt["finished_at"] or attempt["claimed_at"]
         error = attempt["error"]
         runs.append({
-            "id": f"cron_output:{canonical_job_id}:exec:{index}",
+            "id": f"cron_output:{canonical_job_id}:exec:{attempt['id'] or index}",
             **_cron_output_run_row(
                 when,
                 _execution_status_title(attempt["status"], error, "Script-only run"),
+                error or None,
                 error or None,
             ),
             # Internal: the attempt's claim window, so the caller can drop this
@@ -440,7 +445,7 @@ def _list_cron_output_runs(
         title = f"{title} · {preview}"
     return [{
         "id": f"cron_output:{canonical_job_id}:latest",
-        **_cron_output_run_row(latest_ts, title, preview),
+        **_cron_output_run_row(latest_ts, title, preview, preview or None),
     }]
 
 
@@ -602,6 +607,184 @@ def _delete_cron_job_sync(job_id: str, profile: Optional[str] = None):
     return {"ok": True}
 
 
+_CRON_OUTPUT_RUN_PREFIX = "cron_output:"
+_DELETE_RUN_IDS_MAX = 100
+_OUTPUT_DOC_NAME_RE = re.compile(r"^[A-Za-z0-9_\-]+$")
+
+
+def _cron_run_kind(canonical_job_id: str, run_id: str) -> tuple:
+    """Classify a run id emitted by the run-history list.
+
+    Returns ``("session", id)`` for agent sessions, ``("latest", None)`` for the
+    synthetic row derived from job status, ``("exec", execution_id)`` for a ledger-only
+    attempt, or ``("doc", stem)`` for a script-only output document.
+    """
+    prefix = f"{_CRON_OUTPUT_RUN_PREFIX}{canonical_job_id}:"
+    if not run_id.startswith(prefix):
+        return ("session", run_id)
+    rest = run_id[len(prefix):]
+    if rest == "latest":
+        return ("latest", None)
+    if rest.startswith("exec:"):
+        return ("exec", rest[len("exec:"):])
+    return ("doc", rest)
+
+
+def _nearest_session_for_ts(ts: float, sessions: List[Dict[str, Any]], grace_seconds: float = 300.0):
+    """The session an output doc / ledger attempt at ``ts`` belongs to, or None.
+
+    Mirrors the list-side merge window but picks ONE owner (closest span), so
+    deleting a session never removes the record of a neighbouring fire.
+    """
+    best = None
+    best_distance = None
+    for session in sessions:
+        start = float(session.get("started_at") or 0)
+        end = float(session.get("ended_at") or session.get("last_active") or start)
+        if not (start - grace_seconds <= ts <= end + grace_seconds):
+            continue
+        distance = 0.0 if start <= ts <= end else min(abs(ts - start), abs(ts - end))
+        if best_distance is None or distance < best_distance:
+            best, best_distance = session, distance
+    return best
+
+
+def _delete_cron_job_runs_sync(job_id: str, run_ids: str, profile: Optional[str] = None):
+    """Delete selected run-history rows together with every record the list derives them from.
+
+    A session row also removes the output doc and ledger attempt the list merges into it;
+    a script-only doc also removes its ledger attempt; a ledger-only row removes its attempt.
+    The ``:latest`` row is derived from job status and is skipped. Session ids must belong to
+    this job, so a crafted id cannot delete an unrelated session. Running ledger rows are kept.
+    """
+    selected = _job_profile(job_id, profile)
+    run_id_list = list(dict.fromkeys(rid.strip() for rid in (run_ids or "").split(",") if rid.strip()))
+    if not run_id_list:
+        raise HTTPException(status_code=400, detail="No run IDs provided")
+    if len(run_id_list) > _DELETE_RUN_IDS_MAX:
+        raise HTTPException(status_code=400, detail=f"At most {_DELETE_RUN_IDS_MAX} runs per request")
+
+    from cron.executions import delete_terminal_executions
+
+    skipped: List[str] = []
+    deleted_run_ids: set = set()
+
+    with _owner_home_scope(selected):
+        job = _call_cron_for_profile(selected, "get_job", job_id)
+        canonical = str(job["id"]) if job and job.get("id") else job_id
+        output_dir = _cron_output_runs_dir(selected, canonical)
+        executions = _owner_profile_executions(canonical)
+        cron_session_prefix = f"cron_{canonical}_"
+
+        db = _open_session_db_for_profile(selected)
+        try:
+            job_sessions = db.list_cron_job_runs(canonical, limit=100, offset=0)
+
+            session_ids: List[str] = []
+            doc_paths: set = set()
+            exec_ids: set = set()
+            per_run: Dict[str, Dict[str, Any]] = {}
+
+            def _doc_path_for(stem: str) -> Optional[Path]:
+                if not _OUTPUT_DOC_NAME_RE.match(stem):
+                    return None
+                candidate = (output_dir / f"{stem}.md").resolve()
+                try:
+                    candidate.relative_to(output_dir.resolve())
+                except ValueError:
+                    return None
+                return candidate if candidate.is_file() else None
+
+            def _owned_docs(session: Dict[str, Any]) -> List[Path]:
+                owned = []
+                for path in output_dir.glob("*.md"):
+                    ts = _cron_output_run_timestamp(path)
+                    if ts is None or not path.is_file():
+                        continue
+                    owner = _nearest_session_for_ts(ts, job_sessions)
+                    if owner is not None and owner.get("id") == session.get("id"):
+                        owned.append(path)
+                return owned
+
+            def _owned_exec_ids(session: Dict[str, Any]) -> List[str]:
+                owned = []
+                for attempt in executions:
+                    when = attempt["finished_at"] or attempt["claimed_at"]
+                    if not attempt["id"] or not when:
+                        continue
+                    owner = _nearest_session_for_ts(float(when), job_sessions)
+                    if owner is not None and owner.get("id") == session.get("id"):
+                        owned.append(attempt["id"])
+                return owned
+
+            for rid in run_id_list:
+                kind, value = _cron_run_kind(canonical, rid)
+                if kind == "latest":
+                    skipped.append(f"{rid}: derived from job status, no per-run record to delete")
+                    continue
+                if kind == "session":
+                    session = db.get_session(value) if value else None
+                    if not session or session.get("source") != "cron" or not value.startswith(cron_session_prefix):
+                        skipped.append(f"{rid}: not a run of this job")
+                        continue
+                    session_ids.append(value)
+                    if all(s.get("id") != value for s in job_sessions):
+                        job_sessions.append(session)
+                    per_run[rid] = {"session": session}
+                    for path in _owned_docs(session):
+                        doc_paths.add(path)
+                    exec_ids.update(_owned_exec_ids(session))
+                    continue
+                if kind == "exec":
+                    attempt = next((a for a in executions if a["id"] == value), None)
+                    if attempt is None:
+                        skipped.append(f"{rid}: ledger row not found (already removed?)")
+                        continue
+                    exec_ids.add(value)
+                    per_run[rid] = {"exec": value}
+                    continue
+                path = _doc_path_for(value)
+                if path is None:
+                    skipped.append(f"{rid}: output document not found")
+                    continue
+                doc_ts = _cron_output_run_timestamp(path)
+                doc_paths.add(path)
+                for attempt in executions:
+                    if attempt["status"] not in ("completed", "failed") or not attempt["id"]:
+                        continue
+                    if doc_ts is not None and _execution_contains(attempt, doc_ts):
+                        exec_ids.add(attempt["id"])
+                        break
+                per_run[rid] = {"doc": path}
+
+            removed_sessions = 0
+            if session_ids:
+                removed_sessions = db.delete_sessions(session_ids)
+                deleted_run_ids.update(rid for rid, info in per_run.items() if "session" in info)
+        finally:
+            db.close()
+
+        for path in doc_paths:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+        for rid, info in per_run.items():
+            if "doc" in info:
+                deleted_run_ids.add(rid)
+        removed_execs = delete_terminal_executions(sorted(exec_ids))
+        for rid, info in per_run.items():
+            if "exec" in info and removed_execs:
+                deleted_run_ids.add(rid)
+
+    return {
+        "ok": True,
+        "deleted": len(deleted_run_ids),
+        "sessions_deleted": removed_sessions,
+        "skipped": skipped,
+    }
+
+
 # Retry-After (seconds) on retryable cron-fire 503s: sized to clear a
 # scale-to-zero wake or gateway restart so a scheduler that honors it spaces its
 # next attempt past the outage instead of burning its retry budget in it.
@@ -677,6 +860,12 @@ async def trigger_cron_job(job_id: str, profile: Optional[str] = None):
 @router.delete("/api/cron/jobs/{job_id}")
 async def delete_cron_job(job_id: str, profile: Optional[str] = None):
     return await _run_cron_dashboard_io(_delete_cron_job_sync, job_id, profile)
+
+
+@router.delete("/api/cron/jobs/{job_id}/runs")
+async def delete_cron_job_runs(job_id: str, run_ids: str = Query(...), profile: Optional[str] = None):
+    """Delete specific cron job runs by comma-separated run IDs."""
+    return await _run_cron_dashboard_io(_delete_cron_job_runs_sync, job_id, run_ids, profile)
 
 
 @router.post("/api/cron/fire")

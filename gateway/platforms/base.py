@@ -4023,8 +4023,41 @@ class BasePlatformAdapter(ABC):
         if session_key in self._active_sessions:
             await self._handle_message_while_active(event, session_key)
             return
+        # Two routing keys can map to one session_id (the transcript is keyed by session_id). The
+        # per-key guard above cannot see that, so queue behind the live owner instead of starting
+        # a second concurrent turn on the same transcript.
+        owner_key = self._active_owner_for_session(session_key)
+        if owner_key:
+            logger.warning(
+                "Routing key %s shares session_id with active routing key %s; queueing behind the live turn",
+                session_key, owner_key,
+            )
+            await self._handle_message_while_active(event, owner_key)
+            return
         # Guard installed synchronously BEFORE the task spawns so a second message can't race in.
         event._gateway_accepted = self._start_session_processing(event, session_key)
+
+    def _active_owner_for_session(self, session_key: str) -> Optional[str]:
+        """Return an active routing key whose session_id equals *session_key*'s session_id, else None.
+        Reads the store's in-memory entries only; any lookup failure means no redirect."""
+        store = getattr(self, "_session_store", None)
+        if store is None or not self._active_sessions:
+            return None
+        try:
+            entries = store._entries
+            entry = entries.get(session_key)
+            session_id = getattr(entry, "session_id", None)
+            if not session_id:
+                return None
+            for active_key in list(self._active_sessions):
+                if active_key == session_key:
+                    continue
+                active_entry = entries.get(active_key)
+                if getattr(active_entry, "session_id", None) == session_id:
+                    return active_key
+        except Exception:
+            return None
+        return None
 
     async def _handle_message_while_active(self, event: MessageEvent, session_key: str) -> None:
         """Route a message that arrived while ``session_key`` is busy: bypass

@@ -71,6 +71,9 @@ def _validation_error(message: str, *, path: str, constraint: str, parameters: A
         hint="Retry tool_call with 'arguments' matching the parameters schema above.")
 
 
+from tools.tool_search_session import session_extra_schema
+
+
 def validate_deferred_call_args(name: str, args: Dict[str, Any]) -> Optional[str]:
     """Validate ``tool_call`` arguments against the deferred tool's schema. Models invoke
     deferred tools "blind" (schema unseen) and omit required args; without this, the opaque
@@ -84,7 +87,7 @@ def validate_deferred_call_args(name: str, args: Dict[str, Any]) -> Optional[str
     """
     try:
         from tools.registry import registry as _registry
-        schema = _registry.get_schema(name)
+        schema = session_extra_schema(name) or _registry.get_schema(name)
         if not isinstance(schema, dict):
             return None
         fn = schema.get("function") if schema.get("type") == "function" else schema

@@ -3,7 +3,7 @@ import {
   type CronTriggerController,
   createCronTriggerController,
 } from "@hermes/shared";
-import { Clock, Pause, Pencil, Play, Trash2, X, Zap } from "lucide-react";
+import { Clock, Pause, Pencil, Play, Trash2, X, Zap, List, Eye, Download } from "lucide-react";
 import { Badge } from "@nous-research/ui/ui/components/badge";
 import { Button } from "@nous-research/ui/ui/components/button";
 import { Select, SelectOption } from "@nous-research/ui/ui/components/select";
@@ -17,6 +17,7 @@ import type {
   ProfileInfo,
   SkillInfo,
   ToolsetInfo,
+  CronJobRun,
 } from "@/lib/api";
 import {
   buildCronJobPayload,
@@ -46,7 +47,11 @@ import { useToast } from "@nous-research/ui/hooks/use-toast";
 import { useConfirmDelete } from "@nous-research/ui/hooks/use-confirm-delete";
 import { useModalBehavior } from "@/hooks/useModalBehavior";
 import { Toast } from "@nous-research/ui/ui/components/toast";
-import { Card, CardContent } from "@nous-research/ui/ui/components/card";
+import {
+  Card,
+  CardContent,
+  CardHeader,
+} from "@nous-research/ui/ui/components/card";
 import { Input } from "@nous-research/ui/ui/components/input";
 import { Label } from "@nous-research/ui/ui/components/label";
 import { useI18n } from "@/i18n";
@@ -523,6 +528,123 @@ function profileLabel(profile: string): string {
   return profile === "default" ? "default" : profile;
 }
 
+// The ":latest" row is derived from job status; it has no run record to delete.
+function isSelectableRun(run: CronJobRun): boolean {
+  return !run.id.endsWith(":latest");
+}
+
+interface RunCardProps {
+  run: CronJobRun;
+  selectable: boolean;
+  selected: boolean;
+  deleting: boolean;
+  onToggleSelect: () => void;
+  onDelete: () => void;
+  onViewFullOutput: (run: CronJobRun) => void;
+}
+
+function RunCard({
+  run,
+  selectable,
+  selected,
+  deleting,
+  onToggleSelect,
+  onDelete,
+  onViewFullOutput,
+}: RunCardProps) {
+  const startedAt = run.started_at ? new Date(run.started_at).toLocaleString() : "—";
+  const endedAt = run.ended_at ? new Date(run.ended_at).toLocaleString() : (run.is_active ? "Running..." : "—");
+  const status = run.is_active ? "running" : (run.ended_at ? "completed" : "unknown");
+  const statusTone = status === "running" ? "default" : (run.title?.toLowerCase().includes("failed") ? "destructive" : "success");
+
+  return (
+    <Card className="overflow-hidden">
+      <CardHeader className="p-3 pb-2">
+        <div className="flex items-start justify-between gap-4">
+          <input
+            type="checkbox"
+            className="mt-1 accent-foreground"
+            checked={selected}
+            disabled={!selectable || deleting}
+            onChange={onToggleSelect}
+            title={selectable ? "Select run" : "Job status snapshot, not a run record"}
+            aria-label="Select run"
+          />
+          <div className="flex-1 min-w-0">
+            <div className="flex items-center gap-2 flex-wrap">
+              <span className="font-medium text-sm truncate">{run.title || "Run"}</span>
+              <Badge tone={statusTone}>{status}</Badge>
+              <Badge tone="outline">{run.source || "cron"}</Badge>
+              {run.model && <Badge tone="outline" title={run.model}>model</Badge>}
+            </div>
+            <div className="flex items-center gap-4 text-xs text-muted-foreground mt-1">
+              <span>Started: {startedAt}</span>
+              <span>Ended: {endedAt}</span>
+              {run.message_count > 0 && <span>Messages: {run.message_count}</span>}
+              {run.tool_call_count > 0 && <span>Tool calls: {run.tool_call_count}</span>}
+              {run.input_tokens > 0 && <span>Tokens: {run.input_tokens}+{run.output_tokens}</span>}
+            </div>
+          </div>
+        </div>
+      </CardHeader>
+      <CardContent className="p-3 pt-0">
+        {(run.preview || run.error_detail) && (
+          <div className="mb-2">
+            <Label className="text-xs text-muted-foreground mb-1 block">
+              {run.error_detail ? "Error Details" : "Output Preview"}
+            </Label>
+            <pre className="text-xs bg-muted/50 p-2 rounded max-h-32 overflow-auto whitespace-pre-wrap font-mono text-foreground">
+              {run.error_detail || run.preview}
+            </pre>
+          </div>
+        )}
+        <div className="flex items-center gap-2">
+          <Button
+            ghost
+            size="icon"
+            title="View full output"
+            aria-label="View full output"
+            onClick={() => onViewFullOutput(run)}
+          >
+            <Eye className="h-4 w-4" />
+          </Button>
+          <Button
+            ghost
+            size="icon"
+            title="Download output"
+            aria-label="Download output"
+            onClick={() => downloadOutput(run)}
+          >
+            <Download className="h-4 w-4" />
+          </Button>
+          <Button
+            ghost
+            size="icon"
+            title="Delete run"
+            aria-label="Delete run"
+            disabled={!selectable || deleting}
+            onClick={onDelete}
+          >
+            <Trash2 className="h-4 w-4" />
+          </Button>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+function downloadOutput(run: CronJobRun) {
+  if (run.preview) {
+    const blob = new Blob([run.preview], { type: "text/plain" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `cron-run-${run.id}-${Date.now()}.txt`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+}
+
 const STATUS_TONE: Record<string, "success" | "warning" | "destructive"> = {
   enabled: "success",
   scheduled: "success",
@@ -596,6 +718,15 @@ export default function CronPage() {
 
   // Edit job modal state
   const [editJob, setEditJob] = useState<CronJob | null>(null);
+
+  // View runs modal state
+  const [runsJob, setRunsJob] = useState<CronJob | null>(null);
+  const [runs, setRuns] = useState<CronJobRun[]>([]);
+  const [runsLoading, setRunsLoading] = useState(false);
+  const [runsError, setRunsError] = useState<string | null>(null);
+  const [viewOutputRun, setViewOutputRun] = useState<CronJobRun | null>(null);
+  const [selectedRunIds, setSelectedRunIds] = useState<string[]>([]);
+  const [runsDeleting, setRunsDeleting] = useState(false);
   const [editForm, setEditForm] = useState<CronJobEditorState>(
     emptyCronJobForm,
   );
@@ -836,6 +967,62 @@ export default function CronPage() {
       }
     }
   };
+
+  const loadRuns = useCallback(async (job: CronJob) => {
+    setRunsJob(job);
+    setRuns([]);
+    setSelectedRunIds([]);
+    setRunsLoading(true);
+    setRunsError(null);
+    try {
+      const profile = getJobProfile(job) || "default";
+      const data = await api.getCronJobRuns(job.id, profile, 50);
+      setRuns(data.runs || []);
+    } catch (e) {
+      setRunsError(errorMessage(e));
+    } finally {
+      setRunsLoading(false);
+    }
+  }, []);
+
+  const closeRunsModal = useCallback(() => {
+    setRunsJob(null);
+    setRuns([]);
+    setRunsError(null);
+    setSelectedRunIds([]);
+  }, []);
+
+  const viewFullOutput = useCallback((run: CronJobRun) => {
+    setViewOutputRun(run);
+  }, []);
+
+  const deleteRuns = useCallback(
+    async (ids: string[]) => {
+      if (!runsJob || ids.length === 0) return;
+      const label = ids.length === 1 ? "this run" : `${ids.length} runs`;
+      const confirmed = window.confirm(
+        `Delete ${label} of "${getJobTitle(runsJob)}"? Their output, transcripts, and execution records are removed permanently.`,
+      );
+      if (!confirmed) return;
+      setRunsDeleting(true);
+      try {
+        const profile = getJobProfile(runsJob) || "default";
+        const result = await api.deleteCronJobRuns(runsJob.id, ids, profile);
+        const skipped = result.skipped ?? [];
+        const skippedNote = skipped.length
+          ? ` ${skipped.length} skipped (${skipped[0]}).`
+          : "";
+        showToast(`Deleted ${result.deleted} run(s).${skippedNote}`, "success");
+        setSelectedRunIds([]);
+        await loadRuns(runsJob);
+      } catch (e) {
+        showToast(`Delete failed: ${errorMessage(e)}`, "error");
+      } finally {
+        setRunsDeleting(false);
+      }
+    },
+    [runsJob, loadRuns, showToast],
+  );
 
   const jobDelete = useConfirmDelete({
     onDelete: useCallback(
@@ -1081,6 +1268,212 @@ export default function CronPage() {
         </div>
       )}
 
+      {/* View runs modal */}
+      {runsJob && (
+        <div
+          className="fixed inset-0 z-[100] flex items-center justify-center bg-background/85 p-4"
+          onClick={(e) => e.target === e.currentTarget && closeRunsModal()}
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="runs-cron-title"
+        >
+          <div className={cn(themedBody, "relative w-full max-w-4xl max-h-[90vh] border border-border bg-card shadow-2xl flex flex-col")}>
+            <Button
+              ghost
+              size="icon"
+              onClick={closeRunsModal}
+              className="absolute right-2 top-2 text-muted-foreground hover:text-foreground"
+              aria-label="Close"
+            >
+              <X />
+            </Button>
+
+            <header className="p-5 pb-3 border-b border-border">
+              <h2
+                id="runs-cron-title"
+                className="font-mondwest text-display text-base tracking-wider flex items-center gap-2"
+              >
+                <List className="h-5 w-5" />
+                Run History: {getJobTitle(runsJob)}
+                <span className="text-xs text-muted-foreground font-mono-ui font-normal">
+                  ({runsJob.id})
+                </span>
+              </h2>
+            </header>
+
+            {runs.length > 0 && !runsLoading && !runsError && (
+              <div className="flex flex-wrap items-center gap-3 border-b border-border px-5 py-2 text-xs">
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    className="accent-foreground"
+                    checked={
+                      runs.filter(isSelectableRun).length > 0 &&
+                      selectedRunIds.length === runs.filter(isSelectableRun).length
+                    }
+                    disabled={runsDeleting || runs.filter(isSelectableRun).length === 0}
+                    onChange={(e) =>
+                      setSelectedRunIds(
+                        e.target.checked ? runs.filter(isSelectableRun).map((run) => run.id) : [],
+                      )
+                    }
+                    aria-label="Select all runs"
+                  />
+                  <span>Select all</span>
+                </label>
+                <span className="text-muted-foreground">{selectedRunIds.length} selected</span>
+                <div className="ml-auto flex items-center gap-2">
+                  <Button
+                    ghost
+                    size="sm"
+                    disabled={runsDeleting || selectedRunIds.length === 0}
+                    onClick={() => deleteRuns(selectedRunIds)}
+                  >
+                    Delete selected
+                  </Button>
+                  <Button
+                    ghost
+                    size="sm"
+                    disabled={runsDeleting || runs.filter(isSelectableRun).length === 0}
+                    onClick={() => deleteRuns(runs.filter(isSelectableRun).map((run) => run.id))}
+                  >
+                    Delete all listed
+                  </Button>
+                </div>
+              </div>
+            )}
+
+            <div className="min-h-0 overflow-y-auto p-5">
+              {runsLoading ? (
+                <div className="flex items-center justify-center py-12">
+                  <Spinner />
+                  <span className="ml-3 text-muted-foreground">Loading runs...</span>
+                </div>
+              ) : runsError ? (
+                <div className="text-center py-12">
+                  <p className="text-destructive">Failed to load runs: {runsError}</p>
+                  <Button
+                    className="mt-3"
+                    onClick={() => loadRuns(runsJob!)}
+                  >
+                    Retry
+                  </Button>
+                </div>
+              ) : runs.length === 0 ? (
+                <div className="text-center py-12 text-muted-foreground">
+                  <p>No runs recorded for this job yet.</p>
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  {runs.map((run) => (
+                    <RunCard
+                      key={run.id}
+                      run={run}
+                      selectable={isSelectableRun(run)}
+                      selected={selectedRunIds.includes(run.id)}
+                      deleting={runsDeleting}
+                      onToggleSelect={() =>
+                        setSelectedRunIds((prev) =>
+                          prev.includes(run.id)
+                            ? prev.filter((id) => id !== run.id)
+                            : [...prev, run.id],
+                        )
+                      }
+                      onDelete={() => deleteRuns([run.id])}
+                      onViewFullOutput={viewFullOutput}
+                    />
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* View full output modal */}
+      {viewOutputRun && (
+        <div
+          className="fixed inset-0 z-[100] flex items-center justify-center bg-background/85 p-4"
+          onClick={(e) => e.target === e.currentTarget && setViewOutputRun(null)}
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="view-output-title"
+        >
+          <div className={cn(themedBody, "relative w-full max-w-4xl max-h-[90vh] border border-border bg-card shadow-2xl flex flex-col")}>
+            <Button
+              ghost
+              size="icon"
+              onClick={() => setViewOutputRun(null)}
+              className="absolute right-2 top-2 text-muted-foreground hover:text-foreground"
+              aria-label="Close"
+            >
+              <X />
+            </Button>
+
+            <header className="p-5 pb-3 border-b border-border">
+              <h2
+                id="view-output-title"
+                className="font-mondwest text-display text-base tracking-wider flex items-center gap-2"
+              >
+                <Eye className="h-5 w-5" />
+                Full Output: {viewOutputRun.title || "Run"}
+                <span className="text-xs text-muted-foreground font-mono-ui font-normal">
+                  ({viewOutputRun.id})
+                </span>
+              </h2>
+            </header>
+
+            <div className="min-h-0 overflow-y-auto p-5">
+              {viewOutputRun.preview ? (
+                <div className="space-y-3">
+                  <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                    <span>Source: <code className="font-mono">{viewOutputRun.source || "cron"}</code></span>
+                    <span>Status: <code className="font-mono">{viewOutputRun.is_active ? "running" : (viewOutputRun.ended_at ? "completed" : "unknown")}</code></span>
+                    {viewOutputRun.model && <span>Model: <code className="font-mono">{viewOutputRun.model}</code></span>}
+                    {viewOutputRun.started_at && <span>Started: {new Date(viewOutputRun.started_at).toLocaleString()}</span>}
+                    {viewOutputRun.ended_at && <span>Ended: {new Date(viewOutputRun.ended_at).toLocaleString()}</span>}
+                  </div>
+                  <Label className="text-xs text-muted-foreground block">Full Output</Label>
+                  <pre className="text-sm bg-muted/50 p-4 rounded max-h-[60vh] overflow-auto whitespace-pre-wrap font-mono text-foreground border border-border">
+{viewOutputRun.preview}
+                  </pre>
+                  <div className="flex justify-end gap-2 pt-2">
+                    <Button
+                      ghost
+                      size="sm"
+                      onClick={() => {
+                        navigator.clipboard.writeText(viewOutputRun.preview || "");
+                        showToast("Copied to clipboard", "success");
+                      }}
+                    >
+                      Copy to Clipboard
+                    </Button>
+                    <Button
+                      size="sm"
+                      onClick={() => {
+                        const blob = new Blob([viewOutputRun.preview || ""], { type: "text/plain" });
+                        const url = URL.createObjectURL(blob);
+                        const a = document.createElement("a");
+                        a.href = url;
+                        a.download = `cron-run-${viewOutputRun.id}-${Date.now()}.txt`;
+                        a.click();
+                        URL.revokeObjectURL(url);
+                      }}
+                    >
+                      Download
+                    </Button>
+                  </div>
+                </div>
+              ) : (
+                <div className="text-center py-12 text-muted-foreground">
+                  <p>No output content available for this run.</p>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
       {view === "jobs" && (
       <div className="flex flex-col gap-3">
         <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
@@ -1258,6 +1651,16 @@ export default function CronPage() {
                     onClick={() => handleTrigger(job)}
                   >
                     {triggeringJobKeys.has(jobKey) ? <Spinner /> : <Zap />}
+                  </Button>
+
+                  <Button
+                    ghost
+                    size="icon"
+                    title="View runs"
+                    aria-label="View runs"
+                    onClick={() => loadRuns(job)}
+                  >
+                    <List className="h-4 w-4" />
                   </Button>
 
                   <Button

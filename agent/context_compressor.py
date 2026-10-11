@@ -811,11 +811,10 @@ _TERMINAL_SUMMARY_FAILURES = (
     ),
 )
 
-# Timeouts escalate 60s -> 300s -> 900s: structural repeat offenders back off longer. Truncated summaries
-# (finish_reason=length) walk the same rungs on their own counter: the output cap is deterministic for an
-# unchanged route and prompt, so a flat 30s cooldown let every async-completion turn re-issue the same
-# capped request after its per-turn attempt budget was refilled (#69637).
-_TIMEOUT_COOLDOWN_LADDER = (60, 300, 900)
+# Timeouts escalate 60s -> 300s -> 900s by default; configurable via ContextCompressor.timeout_cooldown_ladder.
+# Per-session ladders allow different sessions to have different backoff policies.
+# A ladder of [60] keeps the minimum 60s between compressions globally.
+_DEFAULT_TIMEOUT_COOLDOWN_LADDER = (60, 300, 900)
 
 # Sustained-overload escalation (#123167): ONE overload aborts so a later retry can still win (#115906),
 # but if every summary attempt keeps aborting the transcript only grows until the session exits
@@ -834,10 +833,12 @@ def _next_timeout_cooldown(compressor: Any, counter: str = "_consecutive_timeout
     """Bump ``compressor.<counter>`` and return the ladder rung for it.
     Module-level (not a method) so callers that bind a single real method onto a stub still exercise the ladder.
     ``counter`` stays separate per failure class: the timeout streak also arms the deterministic stall fallback
-    (``_prior_timeout_failures``), which a truncation must not trigger."""
+    (``_prior_timeout_failures``), which a truncation must not trigger.
+    Uses per-compressor ladder if configured, otherwise falls back to default."""
     n = getattr(compressor, counter, 0) + 1
     setattr(compressor, counter, n)
-    return _TIMEOUT_COOLDOWN_LADDER[min(n, len(_TIMEOUT_COOLDOWN_LADDER)) - 1]
+    ladder = getattr(compressor, "timeout_cooldown_ladder", None) or _DEFAULT_TIMEOUT_COOLDOWN_LADDER
+    return ladder[min(n, len(ladder)) - 1]
 
 
 _MIN_SUMMARY_TOKENS = 2000
@@ -2384,11 +2385,12 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         """Defer retries after a structural no-op WITHOUT striking the anti-thrash breaker.
         Nothing eligible existed, so nothing was "ineffective"; striking would permanently disarm
         auto-compaction on short sessions. The backoff still stops per-turn re-scans."""
-        self._structural_no_op_backoff_until = time.monotonic() + self._STRUCTURAL_NO_OP_BACKOFF_SECONDS
+        backoff = self._get_structural_no_op_backoff_seconds()
+        self._structural_no_op_backoff_until = time.monotonic() + backoff
         if not self.quiet_mode:
             logger.warning(
                 "Compression skipped (%s): retrying in %.0fs (structural no-op backoff)", reason,
-                self._STRUCTURAL_NO_OP_BACKOFF_SECONDS,
+                backoff,
             )
 
     def record_rejected_compaction(self) -> None:
@@ -2614,7 +2616,22 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
     _ANTI_THRASH_RECOVERY_SECONDS = 300.0
 
     # Structural no-op (nothing eligible) is not an ineffective attempt: defer retries instead of striking.
+    # Default 300s; overridden by config.yaml compression.structural_no_op_backoff_seconds (hot-reloadable).
     _STRUCTURAL_NO_OP_BACKOFF_SECONDS = 300.0
+
+    def _get_structural_no_op_backoff_seconds(self) -> float:
+        """Read structural_no_op_backoff_seconds from config.yaml dynamically (hot-reloadable)."""
+        try:
+            from hermes_cli.config import load_config
+            raw = load_config()
+            maybe = raw.get("compression", {}) if isinstance(raw, dict) else {}
+            if isinstance(maybe, dict):
+                val = maybe.get("structural_no_op_backoff_seconds")
+                if val is not None:
+                    return float(val)
+        except Exception:
+            pass
+        return self._STRUCTURAL_NO_OP_BACKOFF_SECONDS
 
     @staticmethod
     def _coerce_max_tokens(value: Any) -> int | None:
@@ -2696,7 +2713,7 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         model_thresholds: dict[str, float] | None = None, threshold_tokens_cap: Any = None,
         proactive_prune_tokens: int = 0, proactive_prune_min_result_chars: int = 8000,
         proactive_prune_min_reclaim_tokens: int = 4096, min_tail_user_messages: int = 1, tail_mode: str = "lean",
-        custom_providers: list | None = None,
+        custom_providers: list | None = None, timeout_cooldown_ladder: tuple[int, ...] | None = None,
     ):
         self.model, self.base_url, self.api_key, self.provider, self.api_mode = model, base_url, api_key, provider, api_mode
         # "lean" = small clamped tail + verbatim-user summary section; "legacy" = 0.20*window tail.
@@ -2740,6 +2757,9 @@ class ContextCompressor(SummaryDispatchMixin, MicroCompactionMixin, ContextEngin
         # non-numeric, <=0) means "no reservation" so the threshold arithmetic never sees a non-int (e.g. a
         # test MagicMock).
         self.abort_on_summary_failure = abort_on_summary_failure
+        # Per-compressor timeout cooldown ladder (seconds). None uses module default (60, 300, 900).
+        # A ladder of (60,) keeps minimum 60s between compressions globally.
+        self.timeout_cooldown_ladder = timeout_cooldown_ladder
 
         # Micro-compaction is OFF by default: each pass breaks the prompt-cache prefix every turn.
         self._micro_compact_enabled = False

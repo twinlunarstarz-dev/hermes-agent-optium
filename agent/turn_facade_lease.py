@@ -14,14 +14,26 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
+from agent.interrupt_compat import request_hard_interrupt
+
 # Same logger name as the origin module so log records / caplog filters are unchanged.
 logger = logging.getLogger("run_agent")
 
 # ``tool_reason`` for a lost session turn lease: attributes the stop to the lease, not the user (#112647).
 _REASON_LEASE_LOST = "session turn lease lost"
+# ``tool_reason`` for a same-process holder preempted by a newer turn on the same session.
+_REASON_SUPERSEDED = "superseded by a newer turn in this process"
+PREEMPT_MESSAGE = "Stopped: a newer turn on this session started in this process."
 
 LEASE_TTL_SECONDS = 300.0
 LEASE_WAIT_SECONDS = 1800.0
+
+# Turn leases this process currently holds. A waiter in this same process must not wait on them:
+# the gateway's in-process session serialization already admitted the waiter, so a row still held
+# by this pid is a turn the gateway gave up on (its slot was released by /stop or a successor) that
+# keeps renewing the row. Guarded by ``_LIVE_LEASES_LOCK``.
+_LIVE_LEASES_LOCK = threading.Lock()
+_LIVE_LEASES: List["DurableTurnLease"] = []
 
 
 class DurableTurnLease:
@@ -101,6 +113,7 @@ class DurableTurnLease:
 
     def release(self) -> None:
         """Release the row and drop the agent's holder attrs (only if they still name this lease)."""
+        _unregister_live_lease(self)
         agent = self.agent
         try:
             self.db.release_session_turn_lease(self.session_id, self.holder)
@@ -109,6 +122,24 @@ class DurableTurnLease:
         if getattr(agent, "_active_session_turn_lease_holder", None) == self.holder:
             agent._active_session_turn_lease_holder = None
             agent._active_session_turn_lease_ttl_seconds = None
+
+    def preempt(self, message: str) -> bool:
+        """End a turn in this process that a newer turn on the same session must not wait behind.
+
+        Stops renewal first, so the row expires within the TTL even if the turn wedges and never
+        reaches its finalizer, then hard-interrupts the turn so it unwinds and releases the row.
+        False when the turn is already winding down."""
+        with self._lock:
+            if not self.turn_active:
+                return False
+            self.turn_active = False
+            self.stop.set()
+            self.interrupt_message = message
+        try:
+            request_hard_interrupt(self.agent, message, tool_reason=_REASON_SUPERSEDED)
+        except Exception:
+            logger.warning("Failed to interrupt superseded session turn: %s", self.session_id, exc_info=True)
+        return True
 
     def is_turn_active(self) -> bool:
         with self._lock:
@@ -211,6 +242,38 @@ class DurableTurnLease:
         return False
 
 
+def _register_live_lease(lease: DurableTurnLease) -> None:
+    with _LIVE_LEASES_LOCK:
+        _LIVE_LEASES.append(lease)
+
+
+def _unregister_live_lease(lease: DurableTurnLease) -> None:
+    with _LIVE_LEASES_LOCK:
+        try:
+            _LIVE_LEASES.remove(lease)
+        except ValueError:
+            pass
+
+
+def live_turn_leases_for(session_id: str, *, exclude: Any = None) -> List[DurableTurnLease]:
+    """Turn leases this process holds for ``session_id``, excluding ones owned by ``exclude``."""
+    if not session_id:
+        return []
+    with _LIVE_LEASES_LOCK:
+        return [
+            lease for lease in _LIVE_LEASES
+            if lease.session_id == session_id and (exclude is None or lease.agent is not exclude)
+        ]
+
+
+def preempt_live_turn_leases(session_id: str, message: str, *, exclude: Any = None) -> int:
+    """Preempt every same-process turn holding a lease on ``session_id``; returns how many acted.
+
+    Used by ``/stop`` (a stale turn the gateway already released must still stop) and by a new
+    turn waiting behind its own process (see ``admit_durable_turn_lease``)."""
+    return sum(1 for lease in live_turn_leases_for(session_id, exclude=exclude) if lease.preempt(message))
+
+
 @dataclass
 class TurnLeaseAdmission:
     """Outcome of ``admit_durable_turn_lease``: exactly one of ``lease`` / ``early_result`` may be set."""
@@ -272,6 +335,12 @@ def admit_durable_turn_lease(
     def _on_wait(elapsed: float) -> None:
         nonlocal reload_needed, announced
         reload_needed = announced = True
+        # A holder in this process is never "another Hermes process": preempt it rather than wait out
+        # the lease wait on ourselves (the gateway already admitted this turn in-process).
+        if live_turn_leases_for(session_id, exclude=agent):
+            preempt_live_turn_leases(session_id, PREEMPT_MESSAGE, exclude=agent)
+            agent._emit_status("⏳ Stopping the previous turn on this session (still running in this process)...")
+            return
         agent._emit_status(
             "⏳ Another Hermes process is using this session; "
             "waiting for it to finish before starting your turn..."
@@ -334,6 +403,7 @@ def admit_durable_turn_lease(
         # The façade never saw this lease; release here so an admitted row is not leaked.
         lease.release()
         raise
+    _register_live_lease(lease)
     admission.lease = lease
     return admission
 

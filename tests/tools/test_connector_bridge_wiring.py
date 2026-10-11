@@ -106,7 +106,9 @@ def test_resolve_unknown_name_points_at_tool_search_not_direct_call():
     _, _, err = resolve_underlying_call({"name": "mempalace_search", "arguments": {}})
     registry.deregister("mcp__mempalace__mempalace_search")
     assert "Did you mean 'mcp__mempalace__mempalace_search'?" in err
-    _, _, err = resolve_underlying_call({"name": "read_file", "arguments": {}})
+    # terminal is kept visible by the global bridge-only default (2026-10-10), so it must
+    # still be refused as directly-listed; read_file is now deferrable-by-default.
+    _, _, err = resolve_underlying_call({"name": "terminal", "arguments": {}})
     assert "directly-listed tool" in err and "not a known tool" not in err
 
 
@@ -322,7 +324,14 @@ def test_search_keeps_only_the_twin_a_colliding_name_reaches(order, caplog):
     assert "GMAIL_FETCH_PROFILE" in warnings[0] and "FETCH_PROFILE" in warnings[0]
 
 
-def test_search_limit_caps_the_group_across_both_legs_and_counts_total():
+def test_search_limit_caps_the_group_across_both_legs_and_counts_total(monkeypatch):
+    # Pins an EMPTY local catalog (the fake defs are not registry-backed), independent of
+    # the global bridge-only default, which would defer manage_connections and count it.
+    from tools.tool_search import ToolSearchConfig
+
+    monkeypatch.setattr("tools.tool_search.load_config_readonly",
+                        lambda: ToolSearchConfig.from_raw({"enabled": "on", "defer_everything": False}))
+
     def many_hits(queries):
         slugs = [f"CUSTOM_X_TOOL_{i}" for i in range(9)]
         return ConnectorLeg(payload={

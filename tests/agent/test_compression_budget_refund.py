@@ -1,7 +1,8 @@
 """Behavioral tests for provider-confirmed compression-budget rearming.
 
-``compression_attempts`` is a shared per-turn backstop (pre-API gate,
-overflow/413 handlers, post-tool gate). Before the refund fix, *successful*
+``compression_attempts`` is a shared backstop (pre-API gate, overflow/413
+handlers, post-tool gate) scoped to one tool round: each completed tool round
+starts a fresh budget. Before the refund fix, *successful*
 pre-API compactions consumed it permanently: a marathon tool turn burned all
 attempts on compactions that worked, the pre-API gate went dark for the rest
 of the turn, and the context grew unchecked until the provider rejected the
@@ -18,6 +19,7 @@ source inspection, only observable compaction counts.
 from __future__ import annotations
 
 import json
+from collections import Counter
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -203,7 +205,8 @@ def _run_marathon_turn(
         _tool_response(i, provider_prompt_tokens) for i in range(n_tool_iterations)
     ]
     responses.append(_stop_response(provider_prompt_tokens))
-    agent.client.chat.completions.create.side_effect = responses
+    create = agent.client.chat.completions.create
+    create.side_effect = responses
 
     compress_calls = []
 
@@ -211,8 +214,9 @@ def _run_marathon_turn(
         # Model a compaction that works: blank out every oversized payload,
         # keeping roles and tool-call pairing intact so sanitization is
         # unaffected. Arm the same provider-verification boundary as the real
-        # compression path.
-        compress_calls.append(len(messages))
+        # compression path. Each entry is (model responses so far, message count),
+        # which groups compactions by the tool round that owns them.
+        compress_calls.append((create.call_count, len(messages)))
         agent.context_compressor._verify_compaction_cleared_threshold = True
         agent.context_compressor.awaiting_real_usage_after_compression = True
         compacted = [
@@ -263,10 +267,16 @@ class TestCompressionBudgetRefund:
         )
 
     @pytest.mark.parametrize("provider_prompt_tokens", [None, THRESHOLD])
-    def test_unverified_or_pressured_compaction_stays_capped(
+    def test_unverified_or_pressured_compaction_stays_capped_per_tool_round(
         self, agent, provider_prompt_tokens
     ):
-        """Missing usage or real usage at threshold cannot recycle the cap."""
+        """Missing usage or real usage at threshold cannot exceed the cap within a tool round.
+
+        Each tool round starts a fresh budget, so compaction may recur once per round. No
+        single round may compact more than ``max_compression_attempts`` times, and no round
+        with pressure is skipped.
+        """
+        cap = agent.max_compression_attempts
         result, compress_calls = _run_marathon_turn(
             agent,
             n_tool_iterations=8,
@@ -274,7 +284,10 @@ class TestCompressionBudgetRefund:
         )
 
         assert result["completed"] is True
-        assert len(compress_calls) <= agent.max_compression_attempts, (
-            "without provider-confirmed headroom the per-turn cap must hold; "
-            f"got {len(compress_calls)} compactions"
+        per_round = Counter(rnd for rnd, _ in compress_calls)
+        assert all(n <= cap for n in per_round.values()), (
+            f"a single tool round exceeded the cap ({cap}): {dict(per_round)}"
+        )
+        assert set(range(1, 9)) <= set(per_round), (
+            f"every pressured tool round must compact: {dict(per_round)}"
         )

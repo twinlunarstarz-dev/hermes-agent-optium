@@ -1,21 +1,21 @@
-"""Behavioral regression tests for the post-tool compression attempt cap.
+"""Behavioral regression tests for the per-tool-round compression attempt cap.
 
 The pre-API pressure gate, the overflow/413 error handlers, and the post-tool
-compaction gate all share ``compression_attempts`` as a per-turn backstop,
-bounded by the resolved ``compression.max_attempts`` cap (default 3).  Before
-the fix the post-tool path neither checked nor incremented the counter, so a
-long tool loop could compact after every tool response for the lifetime of
-the turn.
+compaction gate all share ``compression_attempts`` as a backstop bounded by the
+resolved ``compression.max_attempts`` cap (default 3). The budget is scoped to a
+single tool round: each completed tool round starts a fresh budget, so compaction
+keeps pace with a growing tool loop instead of going dark after the first passes.
 
 These tests drive ``run_conversation()`` through real tool iterations with a
 compressor that always demands compression and assert ``_compress_context``
-fires at most ``max_compression_attempts`` times per turn — no source
+fires at most ``max_compression_attempts`` times per tool round — no source
 inspection, only observable behavior.
 """
 
 from __future__ import annotations
 
 import json
+from collections import Counter
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -120,15 +120,23 @@ def agent():
 
 
 def _run_tool_loop(agent, n_tool_iterations: int):
-    """Drive one turn: ``n_tool_iterations`` tool calls, then a stop."""
+    """Drive one turn: ``n_tool_iterations`` tool calls, then a stop.
+
+    Returns ``(result, compress_calls)`` where each entry is ``(round, message_count)``.
+    ``round`` counts the model responses received before the compaction: 0 is turn start,
+    and k is the post-tool gate after the k-th tool round or a pre-API pass before the next
+    request. Entries therefore group compactions by the tool round that owns them.
+    """
     responses = [_tool_response(i) for i in range(n_tool_iterations)]
     responses.append(_stop_response())
-    agent.client.chat.completions.create.side_effect = responses
+    create = agent.client.chat.completions.create
+    base = create.call_count
+    create.side_effect = responses
 
     compress_calls = []
 
     def _fake_compress(messages, system_message, **_kwargs):
-        compress_calls.append(len(messages))
+        compress_calls.append((create.call_count - base, len(messages)))
         return messages, "compressed prompt"
 
     with (
@@ -160,50 +168,38 @@ class TestPostToolCompressionAttemptCap:
         assert result["completed"] is True
         assert compress_calls == []
 
-    def test_post_tool_compression_capped_at_default_three(self, agent):
-        """7 tool iterations under constant pressure → exactly 3 compactions.
+    def test_post_tool_compression_runs_once_per_tool_round_under_pressure(self, agent):
+        """7 tool iterations under constant pressure → one post-tool compaction per round.
 
-        Before the fix the post-tool gate re-fired after every tool response
-        (7 compactions here); the shared per-turn counter caps it at the
-        resolved default of 3.
+        Pre-API preflight stands down (deferred), so only the post-tool gate compacts. Each
+        completed tool round opens its own budget and that gate fires once per round.
         """
+        result, compress_calls = _run_tool_loop(agent, n_tool_iterations=7)
+
+        assert result["completed"] is True
+        assert [rnd for rnd, _ in compress_calls] == list(range(1, 8)), compress_calls
+
+    def test_pre_api_and_post_tool_share_one_budget_per_tool_round(self, agent):
+        """Pre-API and post-tool passes draw from one budget per tool round.
+
+        Deferral is off, so both gates want to compact on every round. Each round may spend
+        at most the cap across both gates, and the next tool round starts with a fresh
+        budget instead of inheriting the spent one.
+        """
+        agent.context_compressor.should_defer_preflight_to_real_usage.return_value = False
         cap = agent.max_compression_attempts
-        assert 0 < cap < 7
         result, compress_calls = _run_tool_loop(agent, n_tool_iterations=7)
 
         assert result["completed"] is True
-        assert len(compress_calls) == cap, (
-            f"post-tool compression must stop at the per-turn cap ({cap}), "
-            f"got {len(compress_calls)} compactions"
-        )
-
-
-    def test_post_tool_compression_shares_counter_with_pre_api_gate(self, agent):
-        """Pre-API compactions consume the same per-turn budget.
-
-        Let the pre-API pressure gate fire once (defer disabled for the first
-        check), then keep the pressure on through tool iterations: the
-        combined total must still respect the cap.
-        """
-        # First pre-API check does not defer → pre-API gate fires once;
-        # afterwards defer again so only the post-tool gate keeps firing.
-        defers = iter([False])
-        agent.context_compressor.should_defer_preflight_to_real_usage.side_effect = (
-            lambda _t: next(defers, True)
-        )
-        result, compress_calls = _run_tool_loop(agent, n_tool_iterations=7)
-
-        assert result["completed"] is True
-        assert len(compress_calls) == agent.max_compression_attempts, (
-            "pre-API and post-tool compactions must share one per-turn "
-            f"attempt budget, got {len(compress_calls)} total compactions"
-        )
+        per_round = Counter(rnd for rnd, _ in compress_calls)
+        assert set(range(1, 8)) <= set(per_round), per_round
+        assert all(per_round[rnd] == cap for rnd in range(1, 8)), per_round
 
     def test_cap_is_per_turn_not_per_session(self, agent):
-        """A fresh turn gets a fresh attempt budget."""
+        """A fresh turn gets a fresh attempt budget; each tool round compacts once here."""
         _result, first = _run_tool_loop(agent, n_tool_iterations=5)
         agent.client.chat.completions.create.side_effect = None
         _result, second = _run_tool_loop(agent, n_tool_iterations=5)
 
-        assert len(first) == agent.max_compression_attempts
-        assert len(second) == agent.max_compression_attempts
+        assert [rnd for rnd, _ in first] == [1, 2, 3, 4, 5]
+        assert [rnd for rnd, _ in second] == [1, 2, 3, 4, 5]

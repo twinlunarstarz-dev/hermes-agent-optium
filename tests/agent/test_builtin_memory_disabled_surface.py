@@ -21,6 +21,19 @@ from model_tools import get_tool_definitions
 
 
 @pytest.fixture(autouse=True)
+def _pin_eager_surface(monkeypatch):
+    """These tests pin memory *availability* (check_fn gating), not the tool-surface
+    deferral policy. Since 2026-10-10 an unconfigured session assembles bridge-only by
+    default, so ``memory`` would sit behind tool_call and hide what is under test —
+    assemble eagerly instead."""
+    from tools.tool_search import ToolSearchConfig
+
+    eager = ToolSearchConfig.from_raw({"enabled": "on", "defer_everything": False})
+    monkeypatch.setattr("tools.tool_search.load_config", lambda: eager)
+    monkeypatch.setattr("tools.tool_search.load_config_readonly", lambda: eager)
+
+
+@pytest.fixture(autouse=True)
 def _clear_caches():
     """check_fn results and tool definitions are both cached; config written by
     a test only takes effect once those are dropped."""

@@ -368,6 +368,7 @@ def _tool_search_scoped_names(agent) -> frozenset:
         getattr(_registry, "_generation", 0),
         frozenset(enabled) if enabled is not None else None,
         frozenset(disabled) if disabled is not None else None,
+        tuple(sorted(str(d.get("function", {}).get("name", "")) for d in (getattr(agent, "_bridge_extra_defs", None) or []))),
     )
     cached = getattr(agent, "_tool_search_scope_cache", None)
     if cached is not None and cached[0] == cache_key:
@@ -1547,6 +1548,9 @@ def _append_batch_results(agent, messages: list, effective_task_id: str, batch: 
 
 
 def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, *, finalize: bool = True) -> None:
+    from tools.tool_search_session import set_session_extra_defs, set_session_platform
+    set_session_extra_defs(getattr(agent, "_bridge_extra_defs", None))
+    set_session_platform(getattr(agent, "platform", None))
     """Execute tool calls concurrently; results are appended in original call order.
     ``finalize=False`` skips end-of-batch budget enforcement and /steer injection (the
     segmented dispatcher owns turn-end work)."""
@@ -1823,6 +1827,9 @@ def _publish_sequential_result(agent, messages: list, ref: _ToolCallRef, managed
 
 
 def execute_tool_calls_sequential(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, *, finalize: bool = True) -> None:
+    from tools.tool_search_session import set_session_extra_defs, set_session_platform
+    set_session_extra_defs(getattr(agent, "_bridge_extra_defs", None))
+    set_session_platform(getattr(agent, "platform", None))
     from types import SimpleNamespace
     from agent.terminal_approval_batch import terminal_approval_batch, terminal_approval_runs
     for calls in terminal_approval_runs(agent, assistant_message.tool_calls):

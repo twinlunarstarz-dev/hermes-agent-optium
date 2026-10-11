@@ -685,6 +685,11 @@ export const api = {
   // Cron jobs
   getCronJobs: (profile = "all") =>
     fetchJSON<CronJob[]>(`/api/cron/jobs?profile=${encodeURIComponent(profile)}`),
+  
+  getCronJobRuns: (jobId: string, profile = "default", limit = 20) =>
+    fetchJSON<{ runs: CronJobRun[]; limit: number }>(
+      `/api/cron/jobs/${encodeURIComponent(jobId)}/runs?profile=${encodeURIComponent(profile)}&limit=${limit}`,
+    ),
   getCronDeliveryTargets: (profile = "default") =>
     fetchJSON<{ targets: CronDeliveryTarget[] }>(
       `/api/cron/delivery-targets?profile=${encodeURIComponent(profile)}`,
@@ -716,6 +721,8 @@ export const api = {
     fetchJSON<CronJob>(`/api/cron/jobs/${encodeURIComponent(id)}/trigger?profile=${encodeURIComponent(profile)}`, { method: "POST" }),
   deleteCronJob: (id: string, profile = "default") =>
     fetchJSON<{ ok: boolean }>(`/api/cron/jobs/${encodeURIComponent(id)}?profile=${encodeURIComponent(profile)}`, { method: "DELETE" }),
+  deleteCronJobRuns: (jobId: string, runIds: string[], profile = "default") =>
+    fetchJSON<{ ok: boolean; deleted: number; skipped: string[] }>(`/api/cron/jobs/${encodeURIComponent(jobId)}/runs?run_ids=${encodeURIComponent(runIds.join(","))}&profile=${encodeURIComponent(profile)}`, { method: "DELETE" }),
 
   // Automation Blueprints — parameterized automation blueprints
   getAutomationBlueprints: (profile = "default") =>
@@ -2482,6 +2489,26 @@ export interface CronDeliveryTarget {
   name: string;
   home_target_set: boolean;
   home_env_var: string | null;
+}
+
+export interface CronJobRun {
+  id: string;
+  source: string | null;
+  model: string | null;
+  title: string | null;
+  started_at: number;
+  ended_at: number | null;
+  last_active: number;
+  is_active: boolean;
+  message_count: number;
+  tool_call_count: number;
+  input_tokens: number;
+  output_tokens: number;
+  preview: string | null;
+  error_detail?: string | null;
+  profile?: string;
+  archived?: boolean;
+  cwd?: string | null;
 }
 
 export interface AutomationBlueprintField {

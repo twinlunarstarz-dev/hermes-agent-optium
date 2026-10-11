@@ -29,6 +29,7 @@ from tools.connectors.search import (
     connections_in_scope, connector_entries_by_group, connectors_unavailable, remote_schemas_for)
 
 logger = logging.getLogger("tools.tool_search")
+from tools.tool_search_session import (session_extra_defs, session_platform)  # session state for the bridge
 # Bound the work one bridge call requests. Search is capped at the gateway's
 # own limit: the connector search route answers 7 use_cases per request and
 # returns HTTP 502 for 8 or more (measured 2026-09-09), and one local call
@@ -50,6 +51,10 @@ class ToolSearchConfig:
     listing_max_tokens: int = 4000  # budget = min(this, threshold_pct% of context)
     # None = curated default; an explicit list replaces it wholesale ([] = defer no core tools).
     defer_tools: Optional[frozenset] = None
+    # Names that always stay direct (never deferred), e.g. execute_code / terminal.
+    keep_visible: frozenset = frozenset()
+    # True: defer every non-bridge, non-keep_visible tool (registry, context-engine, memory).
+    defer_everything: bool = False
 
     @property
     def effective_defer_tools(self) -> frozenset:
@@ -80,7 +85,9 @@ class ToolSearchConfig:
             listing=_tri_state(raw.get("listing", "auto")),
             listing_max_tokens=_clamped_int(raw.get("listing_max_tokens"), 4000, 200, 60000),
             defer_tools=(frozenset(str(n).strip() for n in defer_raw if str(n).strip())
-                         if isinstance(defer_raw, (list, tuple, set)) else None))
+                         if isinstance(defer_raw, (list, tuple, set)) else None),
+            keep_visible=_keep_visible(raw.get("keep_visible")),
+            defer_everything=_truthy(raw.get("defer_everything")))
 
 
 _TRI_STATE_ALIASES = {"true": "on", "1": "on", "yes": "on", "false": "off", "0": "off", "no": "off"}
@@ -108,20 +115,66 @@ def _safe_float(value: Any, fallback: float) -> float:
         return fallback
 
 
+def _keep_visible(raw: Any) -> frozenset:
+    if not isinstance(raw, (list, tuple, set)):
+        return frozenset()
+    return frozenset(str(n).strip() for n in raw if str(n).strip())
+
+
+def _truthy(raw: Any) -> bool:
+    if isinstance(raw, bool):
+        return raw
+    return str(raw).strip().lower() in ("true", "on", "yes", "1")
+
+
+def _policy_kwargs(config: "ToolSearchConfig") -> Dict[str, Any]:
+    return {"keep_visible": config.keep_visible, "defer_everything": config.defer_everything}
+
+
+# Bridge-only surface default for ALL platforms (user request 2026-10-10): interactive
+# sessions and subordinates alike — cron jobs, delegate_task children, kanban workers.
+# Every tool remains reachable through the bridge (tool_call); explicit user config of
+# defer_everything / keep_visible still wins on any platform.
+
+
 def _config_from_loader(loader_name: str) -> ToolSearchConfig:
     """Tool-search config via ``hermes_cli.config.<loader_name>`` (defaults on any failure)."""
     try:
         import hermes_cli.config as _cfg_mod
         tools_cfg = (getattr(_cfg_mod, loader_name)() or {}).get("tools")
         tools_cfg = tools_cfg if isinstance(tools_cfg, dict) else {}
-        return ToolSearchConfig.from_raw(tools_cfg.get("tool_search"))
+        raw = tools_cfg.get("tool_search")
+        cfg = ToolSearchConfig.from_raw(raw)
     except Exception as e:
         logger.debug("Failed to load tool-search config: %s", e)
         return ToolSearchConfig.from_raw(None)
+    # Global code default: defer everything except execute_code + terminal unless the
+    # user set an explicit policy. Subordinates keep full access via tool_call; disabled
+    # toolsets stay excluded at selection/dispatch, so no new capability is granted.
+    if not (isinstance(raw, dict)
+            and any(k in raw for k in ("defer_everything", "keep_visible"))):
+        cfg = ToolSearchConfig.from_raw({**(raw or {}),
+                                         "keep_visible": ["execute_code", "terminal"],
+                                         "defer_everything": True})
+    return cfg
 
 
 load_config = functools.partial(_config_from_loader, "load_config")
 load_config_readonly = functools.partial(_config_from_loader, "load_config_readonly")  # no copy
+
+
+def load_config_for_platform(platform: Optional[str] = None) -> ToolSearchConfig:
+    """Assembled-surface config (explicit user policy wins over the global default).
+
+    The *platform* argument is accepted for call-site compatibility; since 2026-10-10
+    the bridge-only default applies to every platform, so it no longer changes behavior.
+    Delegates through the module-level ``load_config`` seam so test overrides keep working.
+    """
+    return globals()["load_config"]()
+
+
+def load_config_readonly_for_platform(platform: Optional[str] = None) -> ToolSearchConfig:
+    return globals()["load_config_readonly"]()
 
 
 def _core_tool_names() -> frozenset[str]:
@@ -147,12 +200,21 @@ _DIRECT_SURFACE_TOOLSETS = frozenset({"desktop_ui", "project", "setup"})
 _DEFAULT_DEFERRED_TOOLS = frozenset(DEFAULT_CONFIG["tools"]["tool_search"]["defer"])
 
 
-def is_deferrable_tool_name(name: str, defer_tools: Optional[frozenset] = None) -> bool:
-    """True if a tool is *eligible* for deferral: named in ``defer_tools`` (curated set or
-    user override), OR an MCP tool, OR neither core nor a session-gated GUI surface (i.e. a
-    plugin tool). Bridge names never defer."""
+def is_deferrable_tool_name(name: str, defer_tools: Optional[frozenset] = None, *,
+                            keep_visible: frozenset = frozenset(),
+                            defer_everything: bool = False) -> bool:
+    """True if a tool is *eligible* for deferral. Bridge names never defer; ``keep_visible``
+    names always stay direct. ``defer_everything`` defers every other tool, including tools
+    outside the registry (context-engine and memory-provider tools). Otherwise: named in
+    ``defer_tools`` (curated set or user override), OR an MCP tool, OR neither core nor a
+    session-gated GUI surface (i.e. a plugin tool)."""
     if name in BRIDGE_TOOL_NAMES:
         return False
+    if name in keep_visible:
+        return False
+    if defer_everything:
+        # Only names the registry or this session knows; unknown names are not deferrable.
+        return _registry_toolset(name) is not None or name in _session_extra_names()
     if defer_tools is not None and name in defer_tools:
         return True
     if name in _core_tool_names():
@@ -168,20 +230,40 @@ def _tool_def_names(tool_defs: Iterable[Dict[str, Any]]) -> Iterable[str]:
 
 
 def classify_tools(tool_defs: List[Dict[str, Any]], defer_tools: Optional[frozenset] = None,
+                   *, keep_visible: frozenset = frozenset(),
+                   defer_everything: bool = False,
                    ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Split a tool-defs list into (visible, deferrable); bridge tools are dropped (re-added
-    after classification)."""
+    after classification). Session extras (context-engine / memory-provider tools injected
+    after main assembly) are always kept visible regardless of defer_everything."""
+    session_extras = _session_extra_names()
     visible: List[Dict[str, Any]] = []
     deferrable: List[Dict[str, Any]] = []
     for td, name in zip(tool_defs, _tool_def_names(tool_defs)):
         if name not in BRIDGE_TOOL_NAMES:
-            (deferrable if is_deferrable_tool_name(name, defer_tools) else visible).append(td)
+            if name in session_extras:
+                visible.append(td)
+            else:
+                eligible = is_deferrable_tool_name(name, defer_tools, keep_visible=keep_visible,
+                                                   defer_everything=defer_everything)
+                (deferrable if eligible else visible).append(td)
     return visible, deferrable
 
 
-def _deferrable_in(tool_defs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Deferrable subset of pre-assembly ``tool_defs`` under the read-only user config."""
-    return classify_tools(tool_defs, load_config_readonly().effective_defer_tools)[1]
+def _session_extra_names() -> frozenset:
+    return frozenset(n for n in _tool_def_names(session_extra_defs()) if n)
+
+
+def _deferrable_in(tool_defs: List[Dict[str, Any]],
+                   config: Optional["ToolSearchConfig"] = None) -> List[Dict[str, Any]]:
+    """Deferrable subset of pre-assembly ``tool_defs`` under the read-only user config,
+    plus the session extras (context-engine / memory-provider tools) for this turn."""
+    cfg = config or load_config_readonly_for_platform(session_platform())
+    base = list(tool_defs)
+    seen = set(_tool_def_names(base))
+    merged = base + [td for td, n in zip(session_extra_defs(), _tool_def_names(session_extra_defs()))
+                     if n and n not in seen]
+    return classify_tools(merged, cfg.effective_defer_tools, **_policy_kwargs(cfg))[1]
 
 
 def estimate_tokens_from_schemas(tool_defs: Iterable[Dict[str, Any]]) -> int:
@@ -355,10 +437,14 @@ def assemble_tool_defs(tool_defs: List[Dict[str, Any]], *, context_length: Optio
     config = config or load_config()
     incoming = [td for td, name in zip(tool_defs, _tool_def_names(tool_defs))
                 if name not in BRIDGE_TOOL_NAMES]
-    visible, deferrable = classify_tools(incoming, config.effective_defer_tools)
+    visible, deferrable = classify_tools(incoming, config.effective_defer_tools,
+                                         **_policy_kwargs(config))
     connections_granted = connections_in_scope(incoming)
     if not deferrable:
-        if should_activate(config, 0, context_length, connections_granted=connections_granted):
+        # Bridge tools must always be present when there are session extras (context-engine
+        # / memory-provider tools) so the user can discover/inspect them via tool_search/describe.
+        has_extras = bool(_session_extra_names())
+        if should_activate(config, 0, context_length, connections_granted=connections_granted) or has_extras:
             return AssemblyResult(tool_defs=incoming + bridge_tool_schemas(0, connections_granted=connections_granted),
                                   activated=True, tier=2)
         return AssemblyResult(tool_defs=incoming, activated=False)
@@ -446,7 +532,7 @@ def _string_list_arg(args: Dict[str, Any], key: str, *, dedupe: bool, max_items:
 def dispatch_tool_search(args: Dict[str, Any], *, current_tool_defs: List[Dict[str, Any]],
                          config: Optional[ToolSearchConfig] = None,
                          connector_search: Optional[Any] = None) -> str:
-    config = config or load_config()
+    config = config or load_config_for_platform(session_platform())
     queries, err = _string_list_arg(args, "queries", dedupe=False, max_items=_MAX_QUERIES_PER_CALL,
                                     retry_hint="Retry with fewer, more targeted queries.")
     if err:
@@ -489,14 +575,20 @@ def dispatch_tool_search(args: Dict[str, Any], *, current_tool_defs: List[Dict[s
 def dispatch_tool_describe(args: Dict[str, Any], *, current_tool_defs: List[Dict[str, Any]],
                            config: Optional[ToolSearchConfig] = None,
                            connector_describe: Optional[Any] = None) -> str:
-    config = config or load_config_readonly()
+    config = config or load_config_readonly_for_platform(session_platform())
     names, err = _string_list_arg(
         args, "names", dedupe=True, max_items=_MAX_DESCRIBE_NAMES_PER_CALL,
         retry_hint="Retry with fewer names per call.")
     if err:
         return err
-    deferrable = _deferrable_in(current_tool_defs)
+    deferrable = _deferrable_in(current_tool_defs, config)
     by_name = {name: _fn(td) for td, name in zip(deferrable, _tool_def_names(deferrable)) if name}
+    # Also include session extras (context-engine / memory-provider tools) which are visible,
+    # not deferred, but still describable via tool_describe.
+    for td in session_extra_defs():
+        nm = _fn(td).get("name")
+        if nm:
+            by_name[nm] = _fn(td)
     remote_schemas, hosted_failure = remote_schemas_for(names, current_tool_defs, connector_describe)
 
     tools: Dict[str, Dict[str, Any]] = {}
@@ -515,7 +607,8 @@ def dispatch_tool_describe(args: Dict[str, Any], *, current_tool_defs: List[Dict
         elif is_connector_name(name):
             (undescribed if hosted_failure else not_found).append(name)
         elif _registry_entry(name) is not None and not is_deferrable_tool_name(
-            name, load_config_readonly().effective_defer_tools):
+            name, config.effective_defer_tools,
+            **_policy_kwargs(config)):
             # Registered but bridge/core/GUI-surface: a real name, wrong door.
             errors[name] = not_deferrable_error(name)
         else:
@@ -532,12 +625,16 @@ def dispatch_tool_describe(args: Dict[str, Any], *, current_tool_defs: List[Dict
 
 
 def scoped_deferrable_names(tool_defs: List[Dict[str, Any]]) -> frozenset[str]:
-    """Deferrable names in the *pre-assembly* ``tool_defs`` of the session scope — the
-    universe ``tool_call`` may reach. Gates bridge dispatch AND the executor unwrap so a
-    restricted session cannot invoke an out-of-scope tool via the bridge."""
-    defer_tools = load_config_readonly().effective_defer_tools
-    return frozenset(n for n in _tool_def_names(tool_defs)
-                     if n and is_deferrable_tool_name(n, defer_tools))
+    """Deferrable names in the *pre-assembly* ``tool_defs`` of the session scope plus the
+    session extras — the universe ``tool_call`` may reach. Gates bridge dispatch AND the
+    executor unwrap so a restricted session cannot invoke an out-of-scope tool via the bridge."""
+    cfg = load_config_readonly()
+    names = list(_tool_def_names(tool_defs))
+    seen = set(names)
+    names += [n for n in _tool_def_names(session_extra_defs()) if n and n not in seen]
+    return frozenset(n for n in names
+                     if n and is_deferrable_tool_name(n, cfg.effective_defer_tools,
+                                                      **_policy_kwargs(cfg)))
 
 
 def resolve_underlying_call(args: Dict[str, Any]) -> Tuple[Optional[str], Dict[str, Any], Optional[str]]:
@@ -567,7 +664,8 @@ def resolve_underlying_call(args: Dict[str, Any]) -> Tuple[Optional[str], Dict[s
 
     name = entries[0]["name"]
     raw_args = entries[0]["arguments"]
-    if not is_deferrable_tool_name(name, load_config_readonly().effective_defer_tools):
+    _ro = load_config_readonly()
+    if not is_deferrable_tool_name(name, _ro.effective_defer_tools, **_policy_kwargs(_ro)):
         return None, {}, not_deferrable_error(name)
     return name, raw_args, None
 

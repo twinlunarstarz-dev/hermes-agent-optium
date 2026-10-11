@@ -57,7 +57,14 @@ def _arm_rate_limit_cooldown(
         return None
     current_provider = (getattr(agent, "provider", "") or "").strip().lower()
     primary_provider = ((agent._primary_runtime or {}).get("provider") or "").strip().lower()
-    if getattr(agent, "_fallback_activated", False) and not (primary_provider and current_provider == primary_provider):
+    # Match the model as well as the provider: a free-tier 429 on a fallback model under the same
+    # provider (e.g. openrouter :free) must not bench the paid primary for the free-quota reset window.
+    current_model = str(getattr(agent, "model", "") or "").strip()
+    primary_model = str((agent._primary_runtime or {}).get("model") or "").strip()
+    if getattr(agent, "_fallback_activated", False) and not (
+        primary_provider and current_provider == primary_provider
+        and primary_model and current_model == primary_model
+    ):
         return None
     backoff_count = getattr(agent, "_rate_limit_backoff_count", 0)
     agent._rate_limit_backoff_count = backoff_count + 1

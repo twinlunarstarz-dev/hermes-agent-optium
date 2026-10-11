@@ -1094,7 +1094,9 @@ def _review_tool_whitelist(
     # act on the memory tool's "consolidate now" hint and delete entries no one reviewed.
     memory_on = review_agent._memory_enabled or review_agent._user_profile_enabled
     review_toolsets = ["memory", "skills"] if memory_on and review_memory else ["skills"]
-    whitelist = {t["function"]["name"] for t in get_tool_definitions(enabled_toolsets=review_toolsets, quiet_mode=True)}
+    # Dispatch permission must come from the full registry, not the bridge-visible surface:
+    # deferred tools (e.g. memory) are still allowed, just not advertised.
+    whitelist = {t["function"]["name"] for t in get_tool_definitions(enabled_toolsets=review_toolsets, quiet_mode=True, skip_tool_search_assembly=True)}
     # Read-only file tools: denying read_file/search_files caused a per-review denial storm that
     # starved the loop (read_file also registers the read with the read-before-write guard).
     # Write tools stay denied — autonomous maintenance goes through skill_manage's validation.
