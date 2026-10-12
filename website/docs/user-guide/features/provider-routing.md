@@ -227,3 +227,96 @@ When no `provider_routing` section is configured (the default), the aggregator u
 :::tip Provider Routing vs. Fallback Models
 Provider routing controls which **sub-providers behind OpenRouter** handle your requests. For automatic failover to an entirely different provider when your primary model fails, see [Fallback Providers](./fallback-providers.md).
 :::
+
+## Cost-Aware Auto-Selection (`autoselect`)
+
+The static options above pick a provider using OpenRouter's own notion of "cheapest" — a
+`sort: price` ranking that orders endpoints by **prompt price only**, ignoring cache-read
+and completion pricing. That ranking is provably wrong for cache-heavy workloads: a
+provider that wins on the prompt line can be several times more expensive per request once
+a ~95% cache-hit rate on a large shared prefix and the output tokens are priced in.
+
+`provider_routing.autoselect` replaces that guess with a measured one. It keeps a rolling
+window of the **actual** token mix for each model, prices every eligible endpoint against
+that mix, and switches only when the saving is real.
+
+```yaml
+provider_routing:
+  sort: price
+  models:
+    deepseek/deepseek-v4.1-flash:
+      order: [decart]          # the pin to beat
+      allow_fallbacks: false
+      quantizations: [fp4]     # never crossed by the arbiter
+  autoselect:
+    enabled: true
+    window: 200             # completed requests kept in the rolling mix, per model
+    cadence: 5              # evaluate every N completed requests
+    cooldown: 30            # min requests between actual switches
+    min_margin: 0.15        # required relative saving vs the provider in use
+    payback_horizon: 25     # expected remaining requests used for the payback test
+    compaction_factor: 0.4  # post-switch prompt size as a fraction of the current one
+    endpoint_ttl: 3600      # seconds before endpoint pricing is refetched
+    keep_fallbacks: 2       # trailing providers kept behind the winner for failover
+    min_uptime: 95.0        # reject endpoints below this 1-day uptime percent
+    compact_on_switch: true # one compaction pass before the new provider's first request
+```
+
+### The cost model
+
+For each candidate endpoint the arbiter computes an expected cost per request from the
+measured mix, not from a single price field:
+
+```
+E[cost] = E[uncached_input] x P_prompt
+        + E[cached_input]   x P_cache_read
+        + E[output]         x P_completion
+```
+
+`E[...]` are means over the rolling window; `P_*` come from the endpoint catalog. This is
+the number that actually appears on the invoice, which is why it can rank differently from
+OpenRouter's prompt-price sort.
+
+### The switch decision
+
+A switch costs a one-time cache rebuild: the new provider has none of your prefix cached,
+so the first request after a move pays full prompt price for the whole context. Switching
+for a small saving loses money. The arbiter therefore requires **all** of:
+
+* `(cost_current - cost_best) / cost_current >= min_margin`
+* `(cost_current - cost_best) x payback_horizon > switch_penalty`
+* at least `cooldown` requests have passed since the last switch
+* the endpoint is not quantized outside the requested class
+* `uptime_1d >= min_uptime`
+
+where `switch_penalty = (E[uncached_input] + E[cached_input]) x compaction_factor x
+(P_prompt_best - P_cache_read_current)` — the cost of re-reading the live context uncached
+once.
+
+### Behaviour notes
+
+* **Never crosses a quantization boundary.** With `quantizations: [fp4]` requested, only
+  fp4 endpoints are ever considered, even if an fp8 endpoint is cheaper.
+* **Quantization is part of the price identity.** `P_prompt` for `fp8` can be *lower* than
+  for `fp4` while a different field is higher, so the same provider can rank differently
+  depending on the requested class. The arbiter always prices the class in use.
+* **One compaction pass per switch.** Because a move re-reads the whole prefix uncached,
+  the loop performs a single compaction pass immediately before the new provider's first
+  request, so it reads the smallest prompt it can. The request is consumed exactly once.
+* **Churn guard.** The first-ever switch is exempt from `cooldown` so a mis-set config
+  corrects itself on the next cadence; every switch after that waits.
+* **Fail-open.** Any error (missing key, network failure, malformed catalog) leaves your
+  configured routing in place. The arbiter never blocks a request and never raises into the
+  turn loop. Models with no OpenRouter catalog are remembered as unavailable for one
+  `endpoint_ttl` so a local model does not pay a fetch every cadence.
+
+### State
+
+| File | Contents |
+|---|---|
+| `$HERMES_HOME/state/provider_cost.json` | rolling mix + counters per model |
+| `$HERMES_HOME/state/provider_endpoints_cache.json` | endpoint prices with TTL |
+| `$HERMES_HOME/logs/provider_arbiter.jsonl` | append-only decision/switch audit trail |
+
+Set `autoselect.enabled: false` (or delete the block) to disable. Cost is
+`cost_current - cost_best <= 0` never switches.

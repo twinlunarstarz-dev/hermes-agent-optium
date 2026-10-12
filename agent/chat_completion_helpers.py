@@ -515,6 +515,14 @@ def _provider_preferences_for_agent(agent) -> Dict[str, Any]:
     # But we preserve True explicitly so the config intent is clear in logs/debugging.
     merged["allow_fallbacks"] = False if merged.get("allow_fallbacks") is False else merged.get("allow_fallbacks")
     merged["quantizations"] = _validated_openrouter_quantizations(merged.get("quantizations"))
+    # Cost-aware arbitration: when the measured token mix makes a provider switch pay for
+    # itself, this replaces ``order`` (agent/provider_cost_arbiter.py). Guarded, so a
+    # failure leaves the configured routing exactly as it was.
+    with contextlib.suppress(Exception):
+        from agent.provider_cost_arbiter import provider_overrides_for_agent
+        _arbiter_patch = provider_overrides_for_agent(agent)
+        if _arbiter_patch:
+            merged.update({k: v for k, v in _arbiter_patch.items() if v is not None})
     # None drops unset keys; empty containers (e.g. ``only: []``) must not reach the wire either.
     return {key: value for key, value in merged.items()
             if value is not None and not (isinstance(value, (list, dict, str)) and not value)}

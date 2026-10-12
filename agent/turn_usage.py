@@ -179,6 +179,12 @@ def record_response_usage(
     agent.session_cache_read_tokens += canonical_usage.cache_read_tokens
     agent.session_cache_write_tokens += canonical_usage.cache_write_tokens
     agent.session_reasoning_tokens += canonical_usage.reasoning_tokens
+    # Cost-aware provider arbitration: feed the measured input/cached/output mix to the
+    # rolling stats store (agent/provider_cost_arbiter.py). Guarded — telemetry must
+    # never break a turn.
+    with suppress(Exception):
+        from agent.provider_cost_arbiter import observe_response_usage
+        observe_response_usage(agent, usage_dict)
     # Rolling history for status-bar averages (last 10).
     with suppress(Exception):
         hist = getattr(agent, "_api_latency_history", None)

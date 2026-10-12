@@ -435,21 +435,38 @@ def _engine_preflight_maintenance(
     """Engine-driven sub-threshold preflight maintenance: engines overriding
     ``should_compress_preflight()`` get exactly ONE ``compress()`` pass; a no-op never
     touches ``blocked``."""
-    _engine_preflight = getattr(_compressor, "should_compress_preflight", None)
-    if not callable(_engine_preflight):
-        return
+    # A pending provider switch asks for exactly ONE compaction pass, so the incoming
+    # provider reads the smallest possible cold prompt (agent/provider_cost_arbiter.py).
+    # The request is consumed here so the pass happens at most once per switch.
+    _switch_request = None
     try:
-        _wants_engine_preflight = bool(_engine_preflight(out.messages))
-    except Exception as _preflight_exc:
-        # A buggy engine must never break an otherwise-healthy turn.
-        logger.debug(
-            "should_compress_preflight raised %s; skipping "
-            "engine-driven preflight maintenance",
-            _preflight_exc,
+        from agent.provider_cost_arbiter import (
+            consume_compaction_request, pending_switch_compaction,
         )
+        if pending_switch_compaction(agent):
+            _switch_request = consume_compaction_request(agent)
+    except Exception:
+        _switch_request = None
+    _engine_preflight = getattr(_compressor, "should_compress_preflight", None)
+    _wants_engine_preflight = False
+    if callable(_engine_preflight):
+        try:
+            _wants_engine_preflight = bool(_engine_preflight(out.messages))
+        except Exception as _preflight_exc:
+            # A buggy engine must never break an otherwise-healthy turn.
+            logger.debug(
+                "should_compress_preflight raised %s; skipping "
+                "engine-driven preflight maintenance",
+                _preflight_exc,
+            )
+            _wants_engine_preflight = False
+    if not _wants_engine_preflight and _switch_request is None:
         return
-    if not _wants_engine_preflight:
-        return
+    if _switch_request is not None:
+        logger.info(
+            "Provider-switch compaction: %s -> %s requested one compress() pass at ~%s tokens",
+            _switch_request.get("from"), _switch_request.get("to"), f"{_preflight_tokens:,}",
+        )
     logger.info(
         "Engine-driven preflight maintenance: %s requested "
         "compress() at ~%s tokens (below %s threshold)",
