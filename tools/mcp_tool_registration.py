@@ -386,8 +386,16 @@ def _write_schema_cache(name: str, server: "MCPServerTask", config: dict, should
         utility_payload = [{"schema": e["schema"], "handler_key": e["handler_key"]}
                            for e in _select_utility_schemas(name, server, config)]
         cache_meta = getattr(server, "_list_cache_meta", None) or {}
+        # A zero/absent ``ttlMs`` is NOT a hint that the manifest is already stale: the MCP SDK's
+        # ``ListToolsResult`` defaults ``ttl_ms`` to 0, so a server advertising no cache hint is
+        # indistinguishable from one saying "0 ms". Recording it made every ``lazy: true`` server
+        # expire on write and fall back to an eager spawn — lazy was dead on arrival. Only a
+        # positive TTL is a real hint.
+        _ttl_hint = cache_meta.get("ttl_ms")
+        if not (isinstance(_ttl_hint, (int, float)) and _ttl_hint > 0):
+            _ttl_hint = None
         write_cache_entry(name, config_fingerprint(config), tools=tools_payload, utility_tools=utility_payload,
-                          ttl_ms=cache_meta.get("ttl_ms"), cache_scope=cache_meta.get("cache_scope"))
+                          ttl_ms=_ttl_hint, cache_scope=cache_meta.get("cache_scope"))
     except Exception as exc:
         logger.debug("MCP schema cache write failed for '%s': %s", name, exc)
 

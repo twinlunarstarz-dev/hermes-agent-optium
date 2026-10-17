@@ -67,7 +67,12 @@ def get_cached_entry(server_name: str, fingerprint: str) -> Optional[dict]:
         return None
     ttl_ms = entry.get("ttl_ms")
     written_at = entry.get("written_at")
-    expired = (isinstance(ttl_ms, (int, float)) and isinstance(written_at, (int, float))
+    # A non-positive TTL means "no TTL" (never expires), matching
+    # ``test_entry_without_ttl_never_expires``. The MCP SDK's ``ListToolsResult`` defaults
+    # ``ttl_ms`` to 0, so a zero on disk — written by an older build, or by a server advertising
+    # no cache hint — is indistinguishable from a real "0 ms" hint, and reading it as instantly
+    # expired silently disabled every ``lazy: true`` server. Real TTLs still expire.
+    expired = (isinstance(ttl_ms, (int, float)) and ttl_ms > 0 and isinstance(written_at, (int, float))
                and (time.time() - written_at) * 1000.0 >= float(ttl_ms))
     return None if expired else entry
 
